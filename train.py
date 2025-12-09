@@ -45,6 +45,8 @@ def analyze_dataset(tensor: torch.Tensor) -> DatasetStats:
 class BluetoothPositioningDataset(Dataset):
     """Dataset wrapper that separates features and 2D coordinate targets."""
 
+    _STD_EPS = 1e-6
+
     def __init__(
         self,
         tensor: torch.Tensor,
@@ -59,7 +61,7 @@ class BluetoothPositioningDataset(Dataset):
 
         if feature_mean is None or feature_std is None:
             feature_mean = raw_features.mean(dim=0)
-            feature_std = raw_features.std(dim=0).clamp(min=1e-6)
+            feature_std = raw_features.std(dim=0).clamp(min=self._STD_EPS)
 
         self.feature_mean = feature_mean
         self.feature_std = feature_std
@@ -101,7 +103,7 @@ def _safe_load_tensor(path: str) -> torch.Tensor:
     try:
         return torch.load(path, map_location="cpu", weights_only=True)
     except TypeError:
-        # Fallback for older PyTorch versions.
+        # Fallback for older PyTorch versions. Only use on trusted files.
         return torch.load(path, map_location="cpu")
 
 
@@ -193,8 +195,8 @@ def train(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Indoor positioning baseline training.")
-    parser.add_argument("--train-path", default="train_data-s02-80-20-seq1.pt", help="Path to training tensor")
-    parser.add_argument("--test-path", default="test_data-s02-80-20-seq1.pt", help="Path to test tensor")
+    parser.add_argument("--train-path", required=True, help="Path to training tensor")
+    parser.add_argument("--test-path", required=True, help="Path to test tensor")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size for training")
     parser.add_argument("--epochs", type=int, default=5, help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
