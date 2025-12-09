@@ -2,6 +2,7 @@ import argparse
 import copy
 import json
 import os
+import warnings
 from dataclasses import dataclass
 from typing import Dict, Tuple
 
@@ -45,7 +46,7 @@ def analyze_dataset(tensor: torch.Tensor) -> DatasetStats:
 class BluetoothPositioningDataset(Dataset):
     """Dataset wrapper that separates features and 2D coordinate targets."""
 
-    _STD_EPS = 1e-6
+    _STD_EPS = 1e-4
 
     def __init__(
         self,
@@ -101,19 +102,22 @@ def save_stats(stats: DatasetStats, path: str) -> None:
         json.dump(stats.__dict__, f, indent=2)
 
 
-def _safe_load_tensor(path: str) -> torch.Tensor:
+def _safe_load_tensor(path: str, allow_unsafe: bool) -> torch.Tensor:
     try:
         return torch.load(path, map_location="cpu", weights_only=True)
     except TypeError:
-        raise RuntimeError(
-            "This PyTorch version does not support weights_only=True; "
-            "upgrade to a secure build or explicitly opt into unsafe loading."
-        )
+        if not allow_unsafe:
+            raise RuntimeError(
+                "This PyTorch version does not support weights_only=True; "
+                "upgrade to a secure build or rerun with --allow-unsafe-load to trust the input file."
+            )
+        warnings.warn("Falling back to torch.load without weights_only=True; only use trusted files.")
+        return torch.load(path, map_location="cpu")
 
 
-def load_tensors(train_path: str, test_path: str) -> Tuple[torch.Tensor, torch.Tensor]:
-    train_tensor = _safe_load_tensor(train_path)
-    test_tensor = _safe_load_tensor(test_path)
+def load_tensors(train_path: str, test_path: str, allow_unsafe: bool) -> Tuple[torch.Tensor, torch.Tensor]:
+    train_tensor = _safe_load_tensor(train_path, allow_unsafe=allow_unsafe)
+    test_tensor = _safe_load_tensor(test_path, allow_unsafe=allow_unsafe)
     return train_tensor, test_tensor
 
 
@@ -206,11 +210,18 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--val-ratio", type=float, default=0.2, help="Validation split ratio")
     parser.add_argument("--output-dir", default="artifacts", help="Directory to store outputs")
+    parser.add_argument(
+        "--allow-unsafe-load",
+        action="store_true",
+        help="Allow torch.load fallback without weights_only=True (use only with trusted files).",
+    )
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_tensor, test_tensor = load_tensors(args.train_path, args.test_path)
+    train_tensor, test_tensor = load_tensors(
+        args.train_path, args.test_path, allow_unsafe=args.allow_unsafe_load
+    )
     feature_dim = train_tensor.size(2) - 2
     stats = analyze_dataset(train_tensor)
     os.makedirs(args.output_dir, exist_ok=True)

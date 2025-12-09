@@ -32,6 +32,7 @@ python train.py --epochs 5 --batch-size 64 --lr 1e-3 \
   --test-path test_data-s02-80-20-seq1.pt \
   --output-dir artifacts
 ```
+If your PyTorch build predates `weights_only=True`, add `--allow-unsafe-load` (only for trusted `.pt` files).
 
 Key CLI options:
 - `--epochs`: training epochs (default 5).
