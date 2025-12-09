@@ -96,9 +96,17 @@ def save_stats(stats: DatasetStats, path: str) -> None:
         json.dump(stats.__dict__, f, indent=2)
 
 
+def _safe_load_tensor(path: str) -> torch.Tensor:
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        # Fallback for older PyTorch versions.
+        return torch.load(path, map_location="cpu")
+
+
 def load_tensors(train_path: str, test_path: str) -> Tuple[torch.Tensor, torch.Tensor]:
-    train_tensor = torch.load(train_path)
-    test_tensor = torch.load(test_path)
+    train_tensor = _safe_load_tensor(train_path)
+    test_tensor = _safe_load_tensor(test_path)
     return train_tensor, test_tensor
 
 
@@ -152,7 +160,7 @@ def train(
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     best_val = float("inf")
-    best_state = None
+    best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
 
     for epoch in range(1, epochs + 1):
         model.train()
