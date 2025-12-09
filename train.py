@@ -8,7 +8,7 @@ from typing import Dict, Tuple
 
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset
 
 
 @dataclass
@@ -125,16 +125,23 @@ def make_datasets(
     train_tensor: torch.Tensor, test_tensor: torch.Tensor, val_ratio: float = 0.2
 ) -> Tuple[BluetoothPositioningDataset, BluetoothPositioningDataset, BluetoothPositioningDataset]:
     generator = torch.Generator().manual_seed(42)
-    full_train = BluetoothPositioningDataset(train_tensor)
-    val_size = int(len(full_train) * val_ratio)
-    train_size = len(full_train) - val_size
-    train_subset, val_subset = random_split(full_train, [train_size, val_size], generator=generator)
+    num_samples = train_tensor.size(0)
+    val_size = int(num_samples * val_ratio)
+    indices = torch.randperm(num_samples, generator=generator)
+    val_indices = indices[:val_size]
+    train_indices = indices[val_size:]
 
-    # Use the training normalization stats for validation and test to avoid leakage.
-    test_dataset = BluetoothPositioningDataset(
-        test_tensor, feature_mean=full_train.feature_mean, feature_std=full_train.feature_std
+    train_split = train_tensor[train_indices]
+    val_split = train_tensor[val_indices]
+
+    train_dataset = BluetoothPositioningDataset(train_split)
+    val_dataset = BluetoothPositioningDataset(
+        val_split, feature_mean=train_dataset.feature_mean, feature_std=train_dataset.feature_std
     )
-    return train_subset, val_subset, test_dataset
+    test_dataset = BluetoothPositioningDataset(
+        test_tensor, feature_mean=train_dataset.feature_mean, feature_std=train_dataset.feature_std
+    )
+    return train_dataset, val_dataset, test_dataset
 
 
 def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict[str, float]:
@@ -154,9 +161,12 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict
             mae_sum += mae.item()
             num_batches += 1
 
+    if num_batches == 0:
+        raise ValueError("Evaluation loader is empty; cannot compute metrics.")
+
     return {
-        "mse": mse_sum / max(num_batches, 1),
-        "mae": mae_sum / max(num_batches, 1),
+        "mse": mse_sum / num_batches,
+        "mae": mae_sum / num_batches,
     }
 
 
@@ -172,6 +182,9 @@ def train(
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     best_val = float("inf")
     best_state = copy.deepcopy(model.state_dict())
+
+    if len(train_loader) == 0 or len(val_loader) == 0:
+        raise ValueError("Train/validation loaders must not be empty.")
 
     for epoch in range(1, epochs + 1):
         model.train()
