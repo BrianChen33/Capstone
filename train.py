@@ -1,4 +1,5 @@
 import argparse
+import copy
 import json
 import os
 from dataclasses import dataclass
@@ -160,7 +161,7 @@ def train(
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     best_val = float("inf")
-    best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    best_state = copy.deepcopy(model.state_dict())
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -183,10 +184,9 @@ def train(
 
         if val_metrics["mse"] < best_val:
             best_val = val_metrics["mse"]
-            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            best_state = copy.deepcopy(model.state_dict())
 
-    if best_state is not None:
-        model.load_state_dict(best_state)
+    model.load_state_dict(best_state)
 
     return {"best_val_mse": best_val}
 
