@@ -1,5 +1,6 @@
 import argparse
 import copy
+import inspect
 import json
 import os
 import warnings
@@ -46,7 +47,7 @@ def analyze_dataset(tensor: torch.Tensor) -> DatasetStats:
 class BluetoothPositioningDataset(Dataset):
     """Dataset wrapper that separates features and 2D coordinate targets."""
 
-    _STD_EPS = 1e-4
+    _STD_EPS = 1e-5
 
     def __init__(
         self,
@@ -102,17 +103,21 @@ def save_stats(stats: DatasetStats, path: str) -> None:
         json.dump(stats.__dict__, f, indent=2)
 
 
+def _supports_weights_only() -> bool:
+    return "weights_only" in inspect.signature(torch.load).parameters
+
+
 def _safe_load_tensor(path: str, allow_unsafe: bool) -> torch.Tensor:
-    try:
+    if _supports_weights_only():
         return torch.load(path, map_location="cpu", weights_only=True)
-    except TypeError:
-        if not allow_unsafe:
-            raise RuntimeError(
-                "This PyTorch version does not support weights_only=True; "
-                "upgrade to a secure build or rerun with --allow-unsafe-load to trust the input file."
-            )
-        warnings.warn("Falling back to torch.load without weights_only=True; only use trusted files.")
-        return torch.load(path, map_location="cpu")
+
+    if not allow_unsafe:
+        raise RuntimeError(
+            "This PyTorch version does not support weights_only=True; "
+            "upgrade to a secure build or rerun with --allow-unsafe-load to trust the input file."
+        )
+    warnings.warn("Falling back to torch.load without weights_only=True; only use trusted files.")
+    return torch.load(path, map_location="cpu")
 
 
 def load_tensors(train_path: str, test_path: str, allow_unsafe: bool) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -198,7 +203,7 @@ def train(
             optimizer.step()
             epoch_loss += loss.item()
 
-        avg_loss = epoch_loss / max(len(train_loader), 1)
+        avg_loss = epoch_loss / len(train_loader)
         val_metrics = evaluate(model, val_loader, device)
         print(
             f"Epoch {epoch}/{epochs} - train_mse: {avg_loss:.4f} "

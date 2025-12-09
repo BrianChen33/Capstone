@@ -8,7 +8,7 @@ This repository contains a minimal, reproducible pipeline for analyzing the prov
 - `.gitignore`: ignores generated artifacts such as saved models.
 
 ## Setup
-Install CPU-only PyTorch:
+Install CPU-only PyTorch (tested with 2.2.2+cpu; any recent 2.x CPU wheel is fine):
 
 ```bash
 pip install torch==2.2.2 --index-url https://download.pytorch.org/whl/cpu --progress-bar off
