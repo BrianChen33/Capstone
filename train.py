@@ -94,7 +94,9 @@ class SimpleRegressor(nn.Module):
 
 
 def save_stats(stats: DatasetStats, path: str) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    dirpath = os.path.dirname(path)
+    if dirpath:
+        os.makedirs(dirpath, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(stats.__dict__, f, indent=2)
 
@@ -103,8 +105,10 @@ def _safe_load_tensor(path: str) -> torch.Tensor:
     try:
         return torch.load(path, map_location="cpu", weights_only=True)
     except TypeError:
-        # Fallback for older PyTorch versions. Only use on trusted files.
-        return torch.load(path, map_location="cpu")
+        raise RuntimeError(
+            "This PyTorch version does not support weights_only=True; "
+            "upgrade to a secure build or explicitly opt into unsafe loading."
+        )
 
 
 def load_tensors(train_path: str, test_path: str) -> Tuple[torch.Tensor, torch.Tensor]:
