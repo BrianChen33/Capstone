@@ -175,7 +175,7 @@ def train(
 
         if val_metrics["mse"] < best_val:
             best_val = val_metrics["mse"]
-            best_state = model.state_dict()
+            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -197,6 +197,7 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     train_tensor, test_tensor = load_tensors(args.train_path, args.test_path)
+    feature_dim = train_tensor.size(2) - 2
     stats = analyze_dataset(train_tensor)
     os.makedirs(args.output_dir, exist_ok=True)
     save_stats(stats, os.path.join(args.output_dir, "dataset_stats.json"))
@@ -216,7 +217,7 @@ def main() -> None:
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size)
 
-    model = SimpleRegressor(input_dim=train_dataset.dataset.features.size(1)).to(device)
+    model = SimpleRegressor(input_dim=feature_dim).to(device)
     train(model, train_loader, val_loader, device=device, epochs=args.epochs, lr=args.lr)
 
     test_metrics = evaluate(model, test_loader, device)

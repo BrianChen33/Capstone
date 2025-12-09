@@ -27,9 +27,9 @@ pip install torch==2.2.2 --index-url https://download.pytorch.org/whl/cpu --prog
 Run a quick smoke training (adjust epochs/batch size as needed):
 
 ```bash
-python train.py --epochs 5 --batch-size 64 --lr 1e-3 \\
-  --train-path train_data-s02-80-20-seq1.pt \\
-  --test-path test_data-s02-80-20-seq1.pt \\
+python train.py --epochs 5 --batch-size 64 --lr 1e-3 \
+  --train-path train_data-s02-80-20-seq1.pt \
+  --test-path test_data-s02-80-20-seq1.pt \
   --output-dir artifacts
 ```
 
