@@ -14,6 +14,10 @@ from torch.utils.data import DataLoader, Dataset
 
 @dataclass
 class DatasetStats:
+    """
+    数据类，用于存储数据集的统计信息。
+    包括样本数、特征维度、特征的均值/标准差/极值，以及坐标的范围。
+    """
     num_samples: int
     feature_dim: int
     feature_mean: float
@@ -25,7 +29,10 @@ class DatasetStats:
 
 
 def analyze_dataset(tensor: torch.Tensor) -> DatasetStats:
-    """Compute simple descriptive statistics for the raw dataset tensor."""
+    """
+    计算原始数据集张量的简单描述性统计信息。
+    功能：分析输入张量的形状，提取特征和坐标，计算样本数量、特征维度、均值、标准差、极值以及坐标范围。
+    """
     if tensor.dim() != 3 or tensor.size(1) != 1 or tensor.size(2) < 3:
         raise ValueError("Expected tensor shape [N, 1, F] with F>=3.")
 
@@ -45,9 +52,12 @@ def analyze_dataset(tensor: torch.Tensor) -> DatasetStats:
 
 
 class BluetoothPositioningDataset(Dataset):
-    """Dataset wrapper that separates features and 2D coordinate targets."""
+    """
+    数据集包装器，用于分离特征和 2D 坐标目标。
+    功能：加载张量数据，进行标准化处理（Z-score），并提供 PyTorch Dataset 接口（__getitem__, __len__）。
+    """
 
-    _STD_EPS = 1e-5
+    _STD_EPS = 1e-5 # 防止除以零的最小标准差值
 
     def __init__(
         self,
@@ -61,12 +71,14 @@ class BluetoothPositioningDataset(Dataset):
         raw_features = tensor[:, 0, :-2]
         targets = tensor[:, 0, -2:]
 
+        # 如果未提供均值和标准差，则从当前数据计算（通常用于训练集）
         if feature_mean is None or feature_std is None:
             feature_mean = raw_features.mean(dim=0)
             feature_std = raw_features.std(dim=0).clamp(min=self._STD_EPS)
 
         self.feature_mean = feature_mean
         self.feature_std = feature_std
+        # 执行标准化Z-score：(x - mean) / std
         self.features = (raw_features - self.feature_mean) / self.feature_std
         self.targets = targets
 
@@ -78,7 +90,10 @@ class BluetoothPositioningDataset(Dataset):
 
 
 class SimpleRegressor(nn.Module):
-    """Small MLP baseline for 2D coordinate regression."""
+    """
+    用于 2D 坐标回归的小型 MLP 基准模型。
+    功能：定义一个包含三个线性层、ReLU 激活函数和 Dropout 的简单神经网络。
+    """
 
     def __init__(self, input_dim: int) -> None:
         super().__init__()
@@ -96,6 +111,7 @@ class SimpleRegressor(nn.Module):
 
 
 def save_stats(stats: DatasetStats, path: str) -> None:
+    """保存数据集统计信息到 JSON 文件。"""
     dirpath = os.path.dirname(path)
     if dirpath:
         os.makedirs(dirpath, exist_ok=True)
@@ -104,10 +120,15 @@ def save_stats(stats: DatasetStats, path: str) -> None:
 
 
 def _supports_weights_only() -> bool:
+    """检查当前 PyTorch 版本是否支持 weights_only 参数（用于安全加载）。"""
     return "weights_only" in inspect.signature(torch.load).parameters
 
 
 def _safe_load_tensor(path: str, allow_unsafe: bool) -> torch.Tensor:
+    """
+    安全加载张量，处理不同 PyTorch 版本的 weights_only 参数。
+    如果版本支持且未强制允许不安全加载，则使用 weights_only=True。
+    """
     if _supports_weights_only():
         return torch.load(path, map_location="cpu", weights_only=True)
 
@@ -121,6 +142,7 @@ def _safe_load_tensor(path: str, allow_unsafe: bool) -> torch.Tensor:
 
 
 def load_tensors(train_path: str, test_path: str, allow_unsafe: bool) -> Tuple[torch.Tensor, torch.Tensor]:
+    """加载训练和测试张量文件。"""
     train_tensor = _safe_load_tensor(train_path, allow_unsafe=allow_unsafe)
     test_tensor = _safe_load_tensor(test_path, allow_unsafe=allow_unsafe)
     return train_tensor, test_tensor
@@ -129,6 +151,10 @@ def load_tensors(train_path: str, test_path: str, allow_unsafe: bool) -> Tuple[t
 def make_datasets(
     train_tensor: torch.Tensor, test_tensor: torch.Tensor, val_ratio: float = 0.2
 ) -> Tuple[BluetoothPositioningDataset, BluetoothPositioningDataset, BluetoothPositioningDataset]:
+    """
+    创建训练集、验证集和测试集。
+    功能：将训练张量按比例划分为训练集和验证集，并使用训练集的统计数据对所有数据集进行标准化。
+    """
     generator = torch.Generator().manual_seed(42)
     num_samples = train_tensor.size(0)
     val_size = int(num_samples * val_ratio)
@@ -139,7 +165,9 @@ def make_datasets(
     train_split = train_tensor[train_indices]
     val_split = train_tensor[val_indices]
 
+    # 创建训练数据集（自动计算均值和标准差）
     train_dataset = BluetoothPositioningDataset(train_split)
+    # 使用训练集的统计数据创建验证集和测试集，防止数据泄露
     val_dataset = BluetoothPositioningDataset(
         val_split, feature_mean=train_dataset.feature_mean, feature_std=train_dataset.feature_std
     )
@@ -150,6 +178,10 @@ def make_datasets(
 
 
 def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict[str, float]:
+    """
+    评估模型性能。
+    功能：在给定的数据加载器上运行模型，计算均方误差 (MSE) 和平均绝对误差 (MAE)。
+    """
     model.eval()
     criterion = nn.MSELoss()
     mae_sum = 0.0
@@ -183,6 +215,10 @@ def train(
     epochs: int,
     lr: float,
 ) -> Dict[str, float]:
+    """
+    训练模型。
+    功能：执行训练循环，使用 Adam 优化器和 MSE 损失函数更新模型权重。在每个 epoch 结束时评估验证集性能，并保存最佳模型状态。
+    """
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     best_val = float("inf")
@@ -220,7 +256,12 @@ def train(
 
 
 def main() -> None:
+    """
+    主函数。
+    功能：解析命令行参数，加载数据，执行分析，创建数据集，训练模型并评估。
+    """
     parser = argparse.ArgumentParser(description="Indoor positioning baseline training.")
+
     parser.add_argument("--train-path", required=True, help="Path to training tensor")
     parser.add_argument("--test-path", required=True, help="Path to test tensor")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size for training")
