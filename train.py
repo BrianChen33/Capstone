@@ -1,10 +1,11 @@
+"""Training script with block-wise z-score preprocessing.
+Uses an MLP backbone (recommended winner from model comparison).
+"""
 import argparse
-import copy
 import inspect
 import json
 import os
 import warnings
-from dataclasses import dataclass
 from typing import Dict, Tuple
 
 import torch
@@ -12,90 +13,127 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
 
-@dataclass
-class DatasetStats:
-    """
-    数据类，用于存储数据集的统计信息。
-    包括样本数、特征维度、特征的均值/标准差/极值，以及坐标的范围。
-    """
-    num_samples: int
-    feature_dim: int
-    feature_mean: float
-    feature_std: float
-    feature_min: float
-    feature_max: float
-    coord_min: Tuple[float, float]
-    coord_max: Tuple[float, float]
+# Field layout
+FIELD_SLICES: Dict[str, Tuple[int, int]] = {
+    "g1_pos": (0, 3),
+    "g2_pos": (3, 6),
+    "g3_pos": (6, 9),
+    "timestamp": (9, 10),
+    "area": (10, 11),
+    "gt_pos": (11, 14),
+    "g1_spec": (14, 14 + 324),
+    "g2_spec": (14 + 324, 14 + 648),
+    "g3_spec": (14 + 648, 14 + 972),
+}
 
 
-def analyze_dataset(tensor: torch.Tensor) -> DatasetStats:
-    """
-    计算原始数据集张量的简单描述性统计信息。
-    功能：分析输入张量的形状，提取特征和坐标，计算样本数量、特征维度、均值、标准差、极值以及坐标范围。
-    """
-    if tensor.dim() != 3 or tensor.size(1) != 1 or tensor.size(2) < 3:
-        raise ValueError("Expected tensor shape [N, 1, F] with F>=3.")
+def _supports_weights_only() -> bool:
+    # 检查当前 torch.load 是否支持 weights_only 参数（PyTorch 2.0+ 才有）
+    return "weights_only" in inspect.signature(torch.load).parameters
 
-    features = tensor[:, 0, :-2]
-    coords = tensor[:, 0, -2:]
 
-    return DatasetStats(
-        num_samples=tensor.size(0),
-        feature_dim=features.size(1),
-        feature_mean=features.mean().item(),
-        feature_std=features.std().item(),
-        feature_min=features.min().item(),
-        feature_max=features.max().item(),
-        coord_min=(coords[:, 0].min().item(), coords[:, 1].min().item()),
-        coord_max=(coords[:, 0].max().item(), coords[:, 1].max().item()),
+def safe_load(path: str, allow_unsafe: bool) -> torch.Tensor:
+    try:
+        if _supports_weights_only():
+            return torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        pass
+    if not allow_unsafe:
+        raise RuntimeError(
+            "This PyTorch version does not support weights_only=True; rerun with --allow-unsafe-load if you trust the file."
+        )
+    warnings.warn("Loading without weights_only=True; only do this for trusted files.")
+    return torch.load(path, map_location="cpu")
+
+
+def split_fields(tensor: torch.Tensor) -> Dict[str, torch.Tensor]:
+    # 将形状 [N,1,986] 的张量按字段切片成 dict，便于后续预处理
+    if tensor.dim() != 3 or tensor.size(1) != 1:
+        raise ValueError("Expected tensor shape [N,1,F].")
+    flat = tensor[:, 0, :]
+    return {name: flat[:, sl[0] : sl[1]] for name, sl in FIELD_SLICES.items()}
+
+
+def compute_stats(train_fields: Dict[str, torch.Tensor]) -> dict:
+    # 只用训练集估计均值/方差，推理和验证共用
+    stats: dict = {}
+    g_pos = torch.cat([train_fields["g1_pos"], train_fields["g2_pos"], train_fields["g3_pos"]], dim=1)
+    stats["g_pos_mean"] = g_pos.mean(dim=0)
+    stats["g_pos_std"] = g_pos.std(dim=0).clamp(min=1e-6)
+
+    ts = train_fields["timestamp"]
+    stats["ts_mean"] = ts.mean(dim=0)
+    stats["ts_std"] = ts.std(dim=0).clamp(min=1e-6)
+
+    for i, key in enumerate(["g1_spec", "g2_spec", "g3_spec"], start=1):
+        s = train_fields[key]
+        stats[f"spec{i}_mean"] = s.mean(dim=0)
+        stats[f"spec{i}_std"] = s.std(dim=0).clamp(min=1e-6)
+    stats["num_samples"] = train_fields["g1_pos"].size(0)
+    return stats
+
+
+def preprocess_block_zscore(fields: Dict[str, torch.Tensor], stats: dict):
+    # 分块 z-score：位置合并归一化，时间戳单独归一化，三路频谱各自归一化
+    g_pos = torch.cat([fields["g1_pos"], fields["g2_pos"], fields["g3_pos"]], dim=1)
+    ts = fields["timestamp"]
+    specs = [fields["g1_spec"], fields["g2_spec"], fields["g3_spec"]]
+
+    g_pos = (g_pos - stats["g_pos_mean"]) / stats["g_pos_std"]
+    ts = (ts - stats["ts_mean"]) / stats["ts_std"]
+    norm_specs = []
+    for i, s in enumerate(specs):
+        mean = stats[f"spec{i+1}_mean"]
+        std = stats[f"spec{i+1}_std"]
+        norm_specs.append((s - mean) / std)
+
+    spec_seq = torch.stack(norm_specs, dim=-1)  # (N, 324, 3)
+    flat_feats = torch.cat([g_pos, ts] + norm_specs, dim=1)
+    meta = torch.cat([g_pos, ts], dim=1)
+    targets = fields["gt_pos"][:, :2]
+    return flat_feats, spec_seq, meta, targets
+
+
+class PositionDataset(Dataset):
+    def __init__(self, flat_feats: torch.Tensor, spec_seq: torch.Tensor, meta: torch.Tensor, targets: torch.Tensor):
+        self.flat_feats = flat_feats
+        self.spec_seq = spec_seq
+        self.meta = meta
+        self.targets = targets
+
+    def __len__(self):
+        return self.targets.size(0)
+
+    def __getitem__(self, idx: int):
+        return (
+            self.flat_feats[idx],
+            self.spec_seq[idx],
+            self.meta[idx],
+            self.targets[idx],
+        )
+
+
+def make_loaders(dataset: Dataset, val_ratio: float, batch_size: int):
+    # 固定种子划分训练/验证，确保可复现
+    N = len(dataset)
+    val_size = int(val_ratio * N)
+    idx = torch.randperm(N, generator=torch.Generator().manual_seed(42))
+    val_idx = idx[:val_size]
+    train_idx = idx[val_size:]
+
+    def subset(idxs):
+        return torch.utils.data.Subset(dataset, idxs)
+
+    train_ds = subset(train_idx)
+    val_ds = subset(val_idx)
+    return (
+        DataLoader(train_ds, batch_size=batch_size, shuffle=True),
+        DataLoader(val_ds, batch_size=batch_size, shuffle=False),
     )
 
 
-class BluetoothPositioningDataset(Dataset):
-    """
-    数据集包装器，用于分离特征和 2D 坐标目标。
-    功能：加载张量数据，进行标准化处理（Z-score），并提供 PyTorch Dataset 接口（__getitem__, __len__）。
-    """
-
-    _STD_EPS = 1e-5 # 防止除以零的最小标准差值
-
-    def __init__(
-        self,
-        tensor: torch.Tensor,
-        feature_mean: torch.Tensor = None,
-        feature_std: torch.Tensor = None,
-    ) -> None:
-        if tensor.dim() != 3 or tensor.size(1) != 1 or tensor.size(2) < 3:
-            raise ValueError("Expected tensor shape [N, 1, F] with F>=3.")
-
-        raw_features = tensor[:, 0, :-2]
-        targets = tensor[:, 0, -2:]
-
-        # 如果未提供均值和标准差，则从当前数据计算（通常用于训练集）
-        if feature_mean is None or feature_std is None:
-            feature_mean = raw_features.mean(dim=0)
-            feature_std = raw_features.std(dim=0).clamp(min=self._STD_EPS)
-
-        self.feature_mean = feature_mean
-        self.feature_std = feature_std
-        # 执行标准化Z-score：(x - mean) / std
-        self.features = (raw_features - self.feature_mean) / self.feature_std
-        self.targets = targets
-
-    def __len__(self) -> int:
-        return self.features.size(0)
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.features[idx], self.targets[idx]
-
-
-class SimpleRegressor(nn.Module):
-    """
-    用于 2D 坐标回归的小型 MLP 基准模型。
-    功能：定义一个包含三个线性层、ReLU 激活函数和 Dropout 的简单神经网络。
-    """
-
-    def __init__(self, input_dim: int) -> None:
+class MLPRegressor(nn.Module):
+    def __init__(self, input_dim: int):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, 256),
@@ -106,210 +144,157 @@ class SimpleRegressor(nn.Module):
             nn.Linear(128, 2),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+    def forward(self, flat_feats, spec_seq, meta):
+        return self.net(flat_feats)
 
 
-def save_stats(stats: DatasetStats, path: str) -> None:
-    """保存数据集统计信息到 JSON 文件。"""
-    dirpath = os.path.dirname(path)
-    if dirpath:
-        os.makedirs(dirpath, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(stats.__dict__, f, indent=2)
+def build_model(flat_dim: int) -> nn.Module:
+    """Factory kept for clarity; returns the recommended MLP regressor."""
+    return MLPRegressor(flat_dim)
 
 
-def _supports_weights_only() -> bool:
-    """检查当前 PyTorch 版本是否支持 weights_only 参数（用于安全加载）。"""
-    return "weights_only" in inspect.signature(torch.load).parameters
-
-
-def _safe_load_tensor(path: str, allow_unsafe: bool) -> torch.Tensor:
-    """
-    安全加载张量，处理不同 PyTorch 版本的 weights_only 参数。
-    如果版本支持且未强制允许不安全加载，则使用 weights_only=True。
-    """
-    if _supports_weights_only():
-        return torch.load(path, map_location="cpu", weights_only=True)
-
-    if not allow_unsafe:
-        raise RuntimeError(
-            "This PyTorch version does not support weights_only=True; "
-            "upgrade to a secure build or rerun with --allow-unsafe-load to trust the input file."
-        )
-    warnings.warn("Falling back to torch.load without weights_only=True; only use trusted files.")
-    return torch.load(path, map_location="cpu")
-
-
-def load_tensors(train_path: str, test_path: str, allow_unsafe: bool) -> Tuple[torch.Tensor, torch.Tensor]:
-    """加载训练和测试张量文件。"""
-    train_tensor = _safe_load_tensor(train_path, allow_unsafe=allow_unsafe)
-    test_tensor = _safe_load_tensor(test_path, allow_unsafe=allow_unsafe)
-    return train_tensor, test_tensor
-
-
-def make_datasets(
-    train_tensor: torch.Tensor, test_tensor: torch.Tensor, val_ratio: float = 0.2
-) -> Tuple[BluetoothPositioningDataset, BluetoothPositioningDataset, BluetoothPositioningDataset]:
-    """
-    创建训练集、验证集和测试集。
-    功能：将训练张量按比例划分为训练集和验证集，并使用训练集的统计数据对所有数据集进行标准化。
-    """
-    generator = torch.Generator().manual_seed(42)
-    num_samples = train_tensor.size(0)
-    val_size = int(num_samples * val_ratio)
-    indices = torch.randperm(num_samples, generator=generator)
-    val_indices = indices[:val_size]
-    train_indices = indices[val_size:]
-
-    train_split = train_tensor[train_indices]
-    val_split = train_tensor[val_indices]
-
-    # 创建训练数据集（自动计算均值和标准差）
-    train_dataset = BluetoothPositioningDataset(train_split)
-    # 使用训练集的统计数据创建验证集和测试集，防止数据泄露
-    val_dataset = BluetoothPositioningDataset(
-        val_split, feature_mean=train_dataset.feature_mean, feature_std=train_dataset.feature_std
-    )
-    test_dataset = BluetoothPositioningDataset(
-        test_tensor, feature_mean=train_dataset.feature_mean, feature_std=train_dataset.feature_std
-    )
-    return train_dataset, val_dataset, test_dataset
-
-
-def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict[str, float]:
-    """
-    评估模型性能。
-    功能：在给定的数据加载器上运行模型，计算均方误差 (MSE) 和平均绝对误差 (MAE)。
-    """
-    model.eval()
-    criterion = nn.MSELoss()
-    mae_sum = 0.0
-    mse_sum = 0.0
-    num_batches = 0
-
-    with torch.no_grad():
-        for features, targets in loader:
-            features, targets = features.to(device), targets.to(device)
-            preds = model(features)
-            mse = criterion(preds, targets)
-            mae = (preds - targets).abs().mean()
-            mse_sum += mse.item()
-            mae_sum += mae.item()
-            num_batches += 1
-
-    if num_batches == 0:
-        raise ValueError("Evaluation loader is empty; cannot compute metrics.")
-
-    return {
-        "mse": mse_sum / num_batches,
-        "mae": mae_sum / num_batches,
-    }
-
-
-def train(
-    model: nn.Module,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    device: torch.device,
-    epochs: int,
-    lr: float,
-) -> Dict[str, float]:
-    """
-    训练模型。
-    功能：执行训练循环，使用 Adam 优化器和 MSE 损失函数更新模型权重。在每个 epoch 结束时评估验证集性能，并保存最佳模型状态。
-    """
-    criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+def train_model(model: nn.Module, loaders, device: torch.device, epochs: int, lr: float):
+    # 训练+验证，记录最佳验证 MSE 并恢复
+    loss_fn = nn.MSELoss()
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    train_loader, val_loader = loaders
+    best_state = None
     best_val = float("inf")
-    best_state = copy.deepcopy(model.state_dict())
-
-    if len(train_loader) == 0 or len(val_loader) == 0:
-        raise ValueError("Train/validation loaders must not be empty.")
 
     for epoch in range(1, epochs + 1):
         model.train()
-        epoch_loss = 0.0
-        for features, targets in train_loader:
-            features, targets = features.to(device), targets.to(device)
-            optimizer.zero_grad()
-            preds = model(features)
-            loss = criterion(preds, targets)
+        train_loss = 0.0
+        for flat_feats, spec_seq, meta, y in train_loader:
+            flat_feats, spec_seq, meta, y = (
+                flat_feats.to(device),
+                spec_seq.to(device),
+                meta.to(device),
+                y.to(device),
+            )
+            opt.zero_grad()
+            pred = model(flat_feats, spec_seq, meta)
+            loss = loss_fn(pred, y)
             loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item()
+            opt.step()
+            train_loss += loss.item()
 
-        avg_loss = epoch_loss / len(train_loader)
-        val_metrics = evaluate(model, val_loader, device)
+        model.eval()
+        mse_sum = 0.0
+        mae_sum = 0.0
+        n = 0
+        with torch.no_grad():
+            for flat_feats, spec_seq, meta, y in val_loader:
+                flat_feats, spec_seq, meta, y = (
+                    flat_feats.to(device),
+                    spec_seq.to(device),
+                    meta.to(device),
+                    y.to(device),
+                )
+                pred = model(flat_feats, spec_seq, meta)
+                mse_sum += loss_fn(pred, y).item() * y.size(0)
+                mae_sum += (pred - y).abs().mean().item() * y.size(0)
+                n += y.size(0)
+        val_mse = mse_sum / n
+        val_mae = mae_sum / n
         print(
-            f"Epoch {epoch}/{epochs} - train_mse: {avg_loss:.4f} "
-            f"val_mse: {val_metrics['mse']:.4f} val_mae: {val_metrics['mae']:.4f}"
+            f"Epoch {epoch}/{epochs} - train_mse: {train_loss/len(train_loader):.4f} val_mse: {val_mse:.4f} val_mae: {val_mae:.4f}"
         )
+        if val_mse < best_val:
+            best_val = val_mse
+            best_state = model.state_dict()
 
-        if val_metrics["mse"] < best_val:
-            best_val = val_metrics["mse"]
-            best_state = copy.deepcopy(model.state_dict())
-
-    model.load_state_dict(best_state)
-
+    if best_state is not None:
+        model.load_state_dict(best_state)
     return {"best_val_mse": best_val}
 
 
-def main() -> None:
-    """
-    主函数。
-    功能：解析命令行参数，加载数据，执行分析，创建数据集，训练模型并评估。
-    """
-    parser = argparse.ArgumentParser(description="Indoor positioning baseline training.")
+def evaluate(model: nn.Module, loader: DataLoader, device: torch.device):
+    loss_fn = nn.MSELoss()
+    model.eval()
+    mse_sum = 0.0
+    mae_sum = 0.0
+    n = 0
+    with torch.no_grad():
+        for flat_feats, spec_seq, meta, y in loader:
+            flat_feats, spec_seq, meta, y = (
+                flat_feats.to(device),
+                spec_seq.to(device),
+                meta.to(device),
+                y.to(device),
+            )
+            pred = model(flat_feats, spec_seq, meta)
+            mse_sum += loss_fn(pred, y).item() * y.size(0)
+            mae_sum += (pred - y).abs().mean().item() * y.size(0)
+            n += y.size(0)
+    return {"mse": mse_sum / n, "mae": mae_sum / n}
 
-    parser.add_argument("--train-path", required=True, help="Path to training tensor")
-    parser.add_argument("--test-path", required=True, help="Path to test tensor")
-    parser.add_argument("--batch-size", type=int, default=64, help="Batch size for training")
-    parser.add_argument("--epochs", type=int, default=5, help="Number of training epochs")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-    parser.add_argument("--val-ratio", type=float, default=0.2, help="Validation split ratio")
-    parser.add_argument("--output-dir", default="artifacts", help="Directory to store outputs")
-    parser.add_argument(
-        "--allow-unsafe-load",
-        action="store_true",
-        help="Allow torch.load fallback without weights_only=True (use only with trusted files).",
-    )
+
+def save_stats(stats: dict, path: str):
+    # 统计包含 tensor，需转 list 才能 JSON 序列化
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # tensors to list
+    serializable = {k: (v.tolist() if torch.is_tensor(v) else v) for k, v in stats.items()}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(serializable, f, indent=2)
+
+
+def save_report(path: str, content: dict):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(content, f, indent=2)
+
+
+def main():
+    # 入口：加载数据 → 预处理 → 划分 → 训练 → 测试 → 落盘模型与统计
+    parser = argparse.ArgumentParser(description="Train positioning models with block-wise z-score.")
+    parser.add_argument("--train-path", required=True)
+    parser.add_argument("--test-path", required=True)
+    parser.add_argument("--model", default="mlp", choices=["mlp", "cnn", "lstm", "transformer"], help="Backbone")
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--epochs", type=int, default=6)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--val-ratio", type=float, default=0.2)
+    parser.add_argument("--output-dir", default="artifacts")
+    parser.add_argument("--allow-unsafe-load", action="store_true")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_tensor, test_tensor = load_tensors(
-        args.train_path, args.test_path, allow_unsafe=args.allow_unsafe_load
-    )
-    feature_dim = train_tensor.size(2) - 2
-    stats = analyze_dataset(train_tensor)
-    os.makedirs(args.output_dir, exist_ok=True)
-    save_stats(stats, os.path.join(args.output_dir, "dataset_stats.json"))
-    print(f"Loaded training data: {stats.num_samples} samples, feature_dim={stats.feature_dim}")
-    print(
-        f"Feature range [{stats.feature_min:.4f}, {stats.feature_max:.4f}], "
-        f"mean={stats.feature_mean:.4f}, std={stats.feature_std:.4f}"
-    )
-    print(
-        f"Coordinate range x[{stats.coord_min[0]:.4f}, {stats.coord_max[0]:.4f}] "
-        f"y[{stats.coord_min[1]:.4f}, {stats.coord_max[1]:.4f}]"
-    )
+    train_tensor = safe_load(args.train_path, allow_unsafe=args.allow_unsafe_load)
+    test_tensor = safe_load(args.test_path, allow_unsafe=args.allow_unsafe_load)
 
-    train_dataset, val_dataset, test_dataset = make_datasets(train_tensor, test_tensor, val_ratio=args.val_ratio)
+    train_fields = split_fields(train_tensor)
+    test_fields = split_fields(test_tensor)
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size)
+    stats = compute_stats(train_fields)
+    flat_train, seq_train, meta_train, y_train = preprocess_block_zscore(train_fields, stats)
+    flat_test, seq_test, meta_test, y_test = preprocess_block_zscore(test_fields, stats)
 
-    model = SimpleRegressor(input_dim=feature_dim).to(device)
-    train(model, train_loader, val_loader, device=device, epochs=args.epochs, lr=args.lr)
+    dataset = PositionDataset(flat_train, seq_train, meta_train, y_train)
+    loaders = make_loaders(dataset, val_ratio=args.val_ratio, batch_size=args.batch_size)
 
+    model = build_model(flat_dim=flat_train.size(1)).to(device)
+    train_model(model, loaders, device=device, epochs=args.epochs, lr=args.lr)
+
+    # test metrics
+    test_loader = DataLoader(PositionDataset(flat_test, seq_test, meta_test, y_test), batch_size=args.batch_size)
     test_metrics = evaluate(model, test_loader, device)
     print(f"Test mse: {test_metrics['mse']:.4f}, test mae: {test_metrics['mae']:.4f}")
 
+    os.makedirs(args.output_dir, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(args.output_dir, "best_model.pt"))
-    with open(os.path.join(args.output_dir, "metrics.json"), "w", encoding="utf-8") as f:
-        json.dump(test_metrics, f, indent=2)
+    save_stats(stats, os.path.join(args.output_dir, "dataset_stats.json"))
+    save_report(
+        os.path.join(args.output_dir, "training_report.json"),
+        {
+            "model": "mlp",
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "lr": args.lr,
+            "val_ratio": args.val_ratio,
+            "test_metrics": test_metrics,
+        },
+    )
 
 
 if __name__ == "__main__":

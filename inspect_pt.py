@@ -9,6 +9,7 @@ import torch
 import numpy as np
 
 def supports_weights_only():
+    # 检查 torch.load 是否支持 weights_only 参数
     return "weights_only" in inspect.signature(torch.load).parameters
 
 def safe_load(path: str, allow_unsafe: bool):
@@ -20,6 +21,7 @@ def safe_load(path: str, allow_unsafe: bool):
     return torch.load(path, map_location="cpu")
 
 def summarize_tensor(t: torch.Tensor):
+    # 输出张量基本统计，避免打印完整内容
     info = {
         "type": type(t).__name__,
         "shape": tuple(t.shape),
@@ -31,6 +33,7 @@ def summarize_tensor(t: torch.Tensor):
     return info
 
 def main():
+    # CLI：查看 .pt 结构，可选保存为 npz 并展示前若干行
     p = argparse.ArgumentParser()
     p.add_argument("path", help=".pt 文件路径")
     p.add_argument("--allow-unsafe", action="store_true", help="如果必须且信任文件，允许不安全加载")

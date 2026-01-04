@@ -61,45 +61,78 @@ This section details the current implementation of the core components, correspo
     - **Checkpointing**: Saves the model state with the lowest validation MSE to `artifacts/best_model.pt`.
 - **Evaluation**: Final evaluation is performed on the held-out test set (`test_data-s02-80-20-seq1.pt`), with metrics saved to `artifacts/metrics.json`.
 
-## 4. Future Plan
+### 3.5 Model Comparison Outcome (current dataset)
+- **Script**: `model_compare.py` (block z-score preprocessing, 80/20 split, batch size 32).
+- **Configs tested**: MLP, CNN, LSTM, Transformer (base), Transformer (tuned, conv+CLS).
+- **Validation MAE (20 epochs)**: MLP ≈ 0.0900, CNN ≈ 0.1077, Transformer_base ≈ 0.1206, Transformer_tuned ≈ 0.1248, LSTM ≈ 0.1660.
+- **Conclusion**: MLP remains the best performer and is the recommended production backbone for this dataset size; Transformer variants are kept in the repo for reference only.
 
-### 4.1 Model Training and Tuning
-**Plan**:
-- **Hyperparameter Optimization**: Systematically tune learning rate, batch size, and dropout rates using grid search or Bayesian optimization.
-- **Advanced Architectures**:
-    - **CNN**: Implement 1D CNNs to capture local correlations in the spatial spectrum.
-    - **Transformer**: Implement the "AoA first, triangulation next" architecture using Transformer encoders to model the global context of the spatial spectrum.
-- **Regularization**: Experiment with weight decay and different dropout strategies to improve generalization.
+## 4. 模型对比与选型（已改为首选 MLP）
 
-### 4.2 Experimental Design
-**Plan**:
-- **Cross-Validation**: Implement k-fold cross-validation to ensure robustness of the results.
-- **Ablation Studies**: Analyze the impact of different feature subsets (e.g., specific frequency bands or antennas).
-- **Comparison**: Compare the deep learning approach against traditional geometric triangulation methods.
-- **Visualization**: Develop tools to visualize the predicted trajectories vs. ground truth to identify error patterns (e.g., corner cases, multipath-heavy regions).
+### 4.1 目标与原则
+统一数据划分、预处理（block-zscore）、损失（MSE）与优化器（Adam，初始 lr=1e-3），以验证集 MAE/MSE 作为主要依据。控制快速迭代的训练轮数为 6，以便对小样本数据集进行公平、可重复的比较。
 
-## 5. Setup and Usage
-Run a quick smoke training (adjust epochs/batch size as needed):
+### 4.2 实验设置与可复现性
+- 脚本：`model_compare.py`（仍保留 CNN/LSTM/Transformer 作为参考基线）。
+- 输入：三路频谱堆叠为 `[N, 324, 3]`，meta 包含 9 维网关位置 + 1 维时间戳。
+- 预处理：block-zscore（仅用训练集统计量）。
+- 划分：80/20 随机划分，seed=42。
+- 训练：6 轮（快速对比），Adam，lr=1e-3，batch size=32。
+- 产物：`artifacts/model_compare/model_compare_metrics.json` 与 `figs/model_val_mae.png`。
+- 复现命令：
+    ```powershell
+    C:/Users/chenb/Desktop/个人资料/nextjs-dashboard/Capstone/.venv/Scripts/python.exe model_compare.py --epochs 6
+    ```
 
-```bash
-python train.py --epochs 5 --batch-size 64 --lr 1e-3 \
-  --train-path train_data-s02-80-20-seq1.pt \
-  --test-path test_data-s02-80-20-seq1.pt \
-  --output-dir artifacts
+### 4.3 模型设计要点（对比理由）
+- **MLP（首选）**：展平后直接回归，参数高效，训练稳定，对小数据集最友好。
+- **1D CNN（参考）**：可抓局部尖峰/平滑模式，但长程依赖与跨网关对齐不足。
+- **LSTM（参考）**：顺序建模对应频率轴，优势有限，当前数据规模下易欠拟合。
+- **Transformer（参考）**：具备全局注意力与扩展潜力，但在本数据量与短轮次下欠收敛，指标落后。
+
+### 4.4 实验结果
+验证集表现（6 轮快速训练，block-zscore，batch 32）：
+
+| 模型 | val_MAE | val_MSE |
+| --- | --- | --- |
+| MLP | ~0.10 | ~0.033 |
+| CNN | ~0.20 | ~0.13 |
+| LSTM | ~0.24 | ~0.19 |
+| Transformer | ~0.25 | ~0.17 |
+
+图表：`artifacts/model_compare/figs/model_val_mae.png`。
+
+### 4.5 选用 MLP 的理由
+1) **小样本稳定性**：在当前数据量与 6 轮限制下，MLP 收敛最快、误差最低；
+2) **推理高效**：参数/算力开销最小，便于部署；
+3) **可扩展性足够**：可通过加宽隐藏层、调节 dropout、权重衰减等方式继续提升，而无需引入复杂归纳偏置；
+4) **风险更低**：相较欠收敛的 Transformer，MLP 在现有数据分布上的泛化更可控。
+
+### 4.6 后续：若扩展数据再评估高级模型
+保留 CNN/LSTM/Transformer 代码仅作参考。若未来有更大数据量或多时刻、多网关场景，可重新开启比较，重点在：更长训练、学习率调度、改进位置编码与通道注意力等。
+
+## 5. 初步训练与代码（已切换为 MLP 默认）
+
+### 5.1 训练脚本
+- 文件：`train.py`
+- 主干：固定为 MLP（`build_model` 返回 MLP）
+- 预处理：block-zscore（训练统计量），标签为 `gt_pos` 前两维。
+- 默认超参：epochs=6，batch_size=64，lr=1e-3，val_ratio=0.2。
+- 产物：`best_model.pt`、`dataset_stats.json`、`training_report.json`。
+
+运行示例（保持 MLP，无需指定模型）：
+
+```powershell
+C:/Users/chenb/Desktop/个人资料/nextjs-dashboard/Capstone/.venv/Scripts/python.exe train.py `
+    --epochs 6 --batch-size 64 --lr 1e-3 `
+    --train-path train_data-s02-80-20-seq1.pt `
+    --test-path test_data-s02-80-20-seq1.pt `
+    --output-dir artifacts
 ```
-If your PyTorch build predates `weights_only=True`, add `--allow-unsafe-load` (only for trusted `.pt` files).
+如遇旧版 PyTorch 不支持 `weights_only=True`，可加 `--allow-unsafe-load`（仅限可信文件）。
 
-Key CLI options:
-- `--epochs`: training epochs (default 5).
-- `--batch-size`: batch size (default 64).
-- `--lr`: learning rate (default 1e-3).
-- `--val-ratio`: validation fraction from the training tensor (default 0.2).
-
-The script prints dataset stats, per-epoch validation metrics, final test MSE/MAE, and writes artifacts under the chosen output directory.
-
-## Model training, tuning, and experimental design
-- **Splits**: Use the built-in 80/20 train/val split for early stopping; keep the provided test tensor for final evaluation only.
-- **Hyperparameters to tune**: learning rate (1e-4–5e-3), batch size (32–256), dropout (0.0–0.3), hidden widths (128–512), and epochs (with early stopping on validation MSE).
-- **Feature handling**: Keep the last two tensor values as regression targets; standardize only the feature columns using training statistics.
-- **Metrics**: Track MSE (optimization target) and MAE (interpretability). Compare validation curves to detect overfitting.
-- **Extensions**: Swap `SimpleRegressor` with deeper MLPs, 1D CNNs over the 984-length spectrum, or lightweight Transformer encoders for spatial-spectral modeling if capacity is needed.
+### 5.2 调优建议（围绕 MLP）
+- 学习率与权重衰减：lr 1e-4–3e-3，wd 0–1e-3。
+- 隐层宽度与深度：隐藏层 128–512，可加一层以提升表示力。
+- 正则化：dropout 0.0–0.3；必要时早停或更长轮次配合 cos 调度。
+- 评估：以验证 MAE/MSE 选模；保持测试集仅用于最终报告。
