@@ -148,9 +148,79 @@ class MLPRegressor(nn.Module):
         return self.net(flat_feats)
 
 
-def build_model(flat_dim: int) -> nn.Module:
-    """Factory kept for clarity; returns the recommended MLP regressor."""
-    return MLPRegressor(flat_dim)
+class CNNRegressor(nn.Module):
+    def __init__(self, meta_dim: int):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv1d(3, 32, kernel_size=5, padding=2),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Conv1d(32, 64, kernel_size=5, padding=2),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(16),
+        )
+        conv_out = 64 * 16
+        self.head = nn.Sequential(
+            nn.Linear(conv_out + meta_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, 2),
+        )
+
+    def forward(self, flat_feats, spec_seq, meta):
+        x = spec_seq.permute(0, 2, 1)  # (B,3,324)
+        x = self.conv(x)
+        x = x.flatten(1)
+        x = torch.cat([x, meta], dim=1)
+        return self.head(x)
+
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, max_len: int = 512):
+        super().__init__()
+        self.pos = nn.Parameter(torch.zeros(1, max_len, d_model))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.pos[:, : x.size(1), :]
+
+
+class TransformerRegressor(nn.Module):
+    def __init__(self, meta_dim: int, d_model: int = 32, nhead: int = 4, num_layers: int = 2, dropout: float = 0.1):
+        super().__init__()
+        self.input_proj = nn.Linear(3, d_model)
+        self.pos = PositionalEncoding(d_model)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=128,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.head = nn.Sequential(
+            nn.Linear(d_model + meta_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 2),
+        )
+
+    def forward(self, flat_feats, spec_seq, meta):
+        x = self.input_proj(spec_seq)
+        x = self.pos(x)
+        x = self.encoder(x)
+        pooled = x.mean(dim=1)
+        x = torch.cat([pooled, meta], dim=1)
+        return self.head(x)
+
+
+def build_model(kind: str, flat_dim: int, meta_dim: int) -> nn.Module:
+    kind = kind.lower()
+    if kind == "mlp":
+        return MLPRegressor(flat_dim)
+    if kind == "cnn":
+        return CNNRegressor(meta_dim=meta_dim)
+    if kind == "transformer":
+        return TransformerRegressor(meta_dim=meta_dim)
+    raise ValueError(f"Unknown model kind: {kind}")
 
 
 def train_model(model: nn.Module, loaders, device: torch.device, epochs: int, lr: float):
@@ -249,7 +319,7 @@ def main():
     parser = argparse.ArgumentParser(description="Train positioning models with block-wise z-score.")
     parser.add_argument("--train-path", required=True)
     parser.add_argument("--test-path", required=True)
-    parser.add_argument("--model", default="mlp", choices=["mlp", "cnn", "lstm", "transformer"], help="Backbone")
+    parser.add_argument("--model", default="mlp", choices=["mlp", "cnn", "transformer"], help="Backbone")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=6)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -273,7 +343,7 @@ def main():
     dataset = PositionDataset(flat_train, seq_train, meta_train, y_train)
     loaders = make_loaders(dataset, val_ratio=args.val_ratio, batch_size=args.batch_size)
 
-    model = build_model(flat_dim=flat_train.size(1)).to(device)
+    model = build_model(args.model, flat_dim=flat_train.size(1), meta_dim=meta_train.size(1)).to(device)
     train_model(model, loaders, device=device, epochs=args.epochs, lr=args.lr)
 
     # test metrics
@@ -287,7 +357,7 @@ def main():
     save_report(
         os.path.join(args.output_dir, "training_report.json"),
         {
-            "model": "mlp",
+            "model": args.model,
             "epochs": args.epochs,
             "batch_size": args.batch_size,
             "lr": args.lr,

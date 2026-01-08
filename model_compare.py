@@ -1,5 +1,9 @@
-"""Model comparison experiments (MLP vs CNN vs LSTM vs Transformer) on Bluetooth positioning.
-Uses block-wise z-score preprocessing as default best practice.
+"""Model comparison experiments (MLP vs CNN vs Transformer) on Bluetooth positioning.
+Uses the report's standard preprocessing: block-wise z-score computed on the training split only.
+
+Note: This script is intentionally configured for a short, fixed-budget comparison:
+- Fixed learning rate (no sweep)
+- Fixed epochs (6)
 """
 import argparse
 import inspect
@@ -13,6 +17,24 @@ import matplotlib.pyplot as plt
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
+
+
+# =====================
+# Fixed paths (combined dataset)
+# =====================
+PROJECT_ROOT = Path(__file__).resolve().parent
+DATASET_DIR = PROJECT_ROOT / "Dataset"
+TRAIN_PT_PATH = DATASET_DIR / "train_combined.pt"
+
+# Fixed training budget (per report)
+FIXED_LR = 1e-3
+FIXED_EPOCHS = 6
+FIXED_SEED = 42
+
+# All outputs go under FigData
+OUT_DIR = PROJECT_ROOT / "FigData" / "ModelCompare" / "combined"
+
+
 
 FIELD_SLICES: Dict[str, Tuple[int, int]] = {
     "g1_pos": (0, 3),
@@ -57,10 +79,6 @@ def split_fields(tensor: torch.Tensor) -> Dict[str, torch.Tensor]:
 def compute_stats(train_fields: Dict[str, torch.Tensor]) -> dict:
     # 仅用训练集计算各块均值/方差
     stats: dict = {}
-    g_pos = torch.cat([train_fields["g1_pos"], train_fields["g2_pos"], train_fields["g3_pos"]], dim=1)
-    stats["g_pos_mean"] = g_pos.mean(dim=0)
-    stats["g_pos_std"] = g_pos.std(dim=0).clamp(min=1e-6)
-
     ts = train_fields["timestamp"]
     stats["ts_mean"] = ts.mean(dim=0)
     stats["ts_std"] = ts.std(dim=0).clamp(min=1e-6)
@@ -78,7 +96,6 @@ def preprocess_block_zscore(fields: Dict[str, torch.Tensor], stats: dict):
     ts = fields["timestamp"]
     specs = [fields["g1_spec"], fields["g2_spec"], fields["g3_spec"]]
 
-    g_pos = (g_pos - stats["g_pos_mean"]) / stats["g_pos_std"]
     ts = (ts - stats["ts_mean"]) / stats["ts_std"]
     norm_specs = []
     for i, s in enumerate(specs):
@@ -111,11 +128,11 @@ class SpecSequenceDataset(Dataset):
         )
 
 
-def make_loaders(dataset: SpecSequenceDataset, batch_size: int = 32):
-    # 固定随机种子划分 8:2 训练/验证
+def make_loaders(dataset: SpecSequenceDataset, batch_size: int = 32, seed: int = 42):
+    # 固定随机种子划分 8:2 训练/验证，并固定训练 loader 的 shuffle
     N = len(dataset)
     val_size = int(0.2 * N)
-    idx = torch.randperm(N, generator=torch.Generator().manual_seed(42))
+    idx = torch.randperm(N, generator=torch.Generator().manual_seed(seed))
     val_idx = idx[:val_size]
     train_idx = idx[val_size:]
 
@@ -124,8 +141,9 @@ def make_loaders(dataset: SpecSequenceDataset, batch_size: int = 32):
 
     train_ds = subset(train_idx)
     val_ds = subset(val_idx)
+    shuffle_gen = torch.Generator().manual_seed(seed)
     return (
-        DataLoader(train_ds, batch_size=batch_size, shuffle=True),
+        DataLoader(train_ds, batch_size=batch_size, shuffle=True, generator=shuffle_gen),
         DataLoader(val_ds, batch_size=batch_size, shuffle=False),
     )
 
@@ -174,23 +192,6 @@ class CNNRegressor(nn.Module):
         return self.head(x)
 
 
-class LSTMRegressor(nn.Module):
-    def __init__(self, meta_dim: int, hidden: int = 64, num_layers: int = 1):
-        super().__init__()
-        self.lstm = nn.LSTM(input_size=3, hidden_size=hidden, num_layers=num_layers, batch_first=True)
-        self.head = nn.Sequential(
-            nn.Linear(hidden + meta_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 2),
-        )
-
-    def forward(self, flat_feats, spec_seq, meta):
-        out, _ = self.lstm(spec_seq)
-        h = out[:, -1, :]
-        x = torch.cat([h, meta], dim=1)
-        return self.head(x)
-
-
 class PositionalEncoding(nn.Module):
     """Learnable positional embedding for sequences."""
 
@@ -203,65 +204,30 @@ class PositionalEncoding(nn.Module):
 
 
 class TransformerRegressor(nn.Module):
-    def __init__(self, meta_dim: int, d_model: int = 32, nhead: int = 4, num_layers: int = 2, dropout: float = 0.1):
+    def __init__(self, meta_dim: int, d_model: int = 48, nhead: int = 6, num_layers: int = 2, dropout: float = 0.0):
         super().__init__()
         self.input_proj = nn.Linear(3, d_model)
+        self.meta_proj = nn.Linear(meta_dim, d_model)
         self.pos = PositionalEncoding(d_model)
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=nhead, dim_feedforward=128, dropout=dropout, batch_first=True
+            d_model=d_model, nhead=nhead, dim_feedforward=192, dropout=dropout, batch_first=True
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.head = nn.Sequential(
             nn.Linear(d_model + meta_dim, 128),
             nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(128, 2),
         )
 
     def forward(self, flat_feats, spec_seq, meta):
-        x = self.input_proj(spec_seq)
+        # Treat meta as a dedicated token to guide attention under a short training budget.
+        spec_tokens = self.input_proj(spec_seq)  # (B, 324, d_model)
+        meta_token = self.meta_proj(meta).unsqueeze(1)  # (B, 1, d_model)
+        x = torch.cat([meta_token, spec_tokens], dim=1)  # (B, 325, d_model)
         x = self.pos(x)
         x = self.encoder(x)
-        pooled = x.mean(dim=1)
-        x = torch.cat([pooled, meta], dim=1)
-        return self.head(x)
-
-
-class ConvTransformerRegressor(nn.Module):
-    """CNN stem to shorten spectrum sequence, Transformer with CLS + meta token."""
-
-    def __init__(self, meta_dim: int, d_model: int = 64, nhead: int = 4, num_layers: int = 4, dropout: float = 0.1):
-        super().__init__()
-        self.stem = nn.Sequential(
-            nn.Conv1d(3, d_model, kernel_size=7, stride=2, padding=3),
-            nn.ReLU(),
-            nn.Conv1d(d_model, d_model, kernel_size=3, padding=1),
-            nn.ReLU(),
-        )
-        self.cls = nn.Parameter(torch.zeros(1, 1, d_model))
-        self.meta_proj = nn.Linear(meta_dim, d_model)
-        self.pos = PositionalEncoding(d_model)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=nhead, dim_feedforward=256, dropout=dropout, batch_first=True, norm_first=True
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.head = nn.Sequential(
-            nn.LayerNorm(d_model + meta_dim),
-            nn.Linear(d_model + meta_dim, 192),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(192, 2),
-        )
-
-    def forward(self, flat_feats, spec_seq, meta):
-        x = spec_seq.permute(0, 2, 1)  # (B, 3, 324)
-        x = self.stem(x)  # (B, d_model, L') with L' ~ 162
-        x = x.permute(0, 2, 1)
-        cls_token = self.cls.expand(x.size(0), 1, -1)
-        meta_token = self.meta_proj(meta).unsqueeze(1)
-        x = torch.cat([cls_token, meta_token, x], dim=1)
-        x = self.pos(x)
-        x = self.encoder(x)
-        pooled = x[:, 0, :]
+        pooled = x[:, 0, :]  # meta token representation
         x = torch.cat([pooled, meta], dim=1)
         return self.head(x)
 
@@ -316,48 +282,81 @@ def train_model(model, loaders, epochs: int = 6, lr: float = 1e-3, weight_decay:
     return {"val_mse": mse_sum / n, "val_mae": mae_sum / n}
 
 
-def run_compare(train_path: Path, allow_unsafe: bool, out_dir: Path, epochs: int = 10):
-    # 跑全模型对比：训练集 → 预处理 → 多模型 → 保存指标和柱状图
+def evaluate_on_loader(model: nn.Module, loader: DataLoader, device: torch.device) -> dict:
+    loss_fn = nn.MSELoss()
+    model.eval()
+    mse_sum = 0.0
+    mae_sum = 0.0
+    n = 0
+    with torch.no_grad():
+        for flat_feats, spec_seq, meta, y in loader:
+            flat_feats, spec_seq, meta, y = flat_feats.to(device), spec_seq.to(device), meta.to(device), y.to(device)
+            pred = model(flat_feats, spec_seq, meta)
+            mse_sum += loss_fn(pred, y).item() * y.size(0)
+            mae_sum += (pred - y).abs().mean().item() * y.size(0)
+            n += y.size(0)
+    return {"mse": mse_sum / n, "mae": mae_sum / n}
+
+
+def run_compare(train_path: Path, allow_unsafe: bool, out_dir: Path):
+    # 跑全模型对比：仅训练集（固定种子 8:2 train/val）→ 统一预处理(仅训练集统计) → 多模型 → 保存指标和柱状图
     out_dir.mkdir(parents=True, exist_ok=True)
     fig_dir = out_dir / "figs"
     fig_dir.mkdir(exist_ok=True)
 
     train_tensor = safe_load(train_path, allow_unsafe=allow_unsafe)
-    fields = split_fields(train_tensor)
-    targets = fields["gt_pos"][:, :2]
-    stats = compute_stats(fields)
-    flat_feats, spec_seq, meta = preprocess_block_zscore(fields, stats)
+    train_fields = split_fields(train_tensor)
+    train_targets = train_fields["gt_pos"][:, :2]
+    stats = compute_stats(train_fields)
+    flat_train, spec_train, meta_train = preprocess_block_zscore(train_fields, stats)
 
-    dataset = SpecSequenceDataset(flat_feats, spec_seq, meta, targets)
-    loaders = make_loaders(dataset, batch_size=32)
+    dataset = SpecSequenceDataset(flat_train, spec_train, meta_train, train_targets)
+    torch.manual_seed(FIXED_SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(FIXED_SEED)
+    loaders = make_loaders(dataset, batch_size=32, seed=FIXED_SEED)
 
-    meta_dim = meta.size(1)
-    # Note: Transformer variants remain below the MLP on this dataset; keep for reference only.
-    models = {
-        "mlp": (MLPRegressor(flat_feats.size(1)), 1e-3),
-        "cnn": (CNNRegressor(meta_dim=meta_dim), 1e-3),
-        "lstm": (LSTMRegressor(meta_dim=meta_dim), 1e-3),
-        "transformer_base": (
-            TransformerRegressor(meta_dim=meta_dim, d_model=32, nhead=4, num_layers=2, dropout=0.1),
-            1e-3,
-        ),
-        "transformer_hybrid": (ConvTransformerRegressor(meta_dim=meta_dim, d_model=64, nhead=4, num_layers=4, dropout=0.1), 5e-4),
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    meta_dim = meta_train.size(1)
+    flat_dim = flat_train.size(1)
+
+    # Keep the comparison aligned with the report: MLP vs CNN vs Transformer.
+    model_factories = {
+        "mlp": lambda: MLPRegressor(flat_dim),
+        "cnn": lambda: CNNRegressor(meta_dim=meta_dim),
+        "transformer": lambda: TransformerRegressor(meta_dim=meta_dim, d_model=48, nhead=6, num_layers=2, dropout=0.0),
     }
 
     results = {}
-    for name, (model, lr) in models.items():
-        print(f"\nTraining {name}")
-        metrics = train_model(model, loaders, epochs=epochs, lr=lr)
-        results[name] = metrics
-        print(f"{name}: val_mse={metrics['val_mse']:.4f}, val_mae={metrics['val_mae']:.4f}")
+    for name, factory in model_factories.items():
+        print(f"\nTraining {name} (fixed lr={FIXED_LR:g}, epochs={FIXED_EPOCHS})")
+        torch.manual_seed(FIXED_SEED)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(FIXED_SEED)
+        model = factory()
+        _ = train_model(model, loaders, epochs=FIXED_EPOCHS, lr=FIXED_LR)
+        model.to(device)
+        # Recompute val metrics on the final best model (device-aware)
+        _, val_loader = loaders
+        val_final = evaluate_on_loader(model, val_loader, device)
+        results[name] = {
+            "lr": float(FIXED_LR),
+            "epochs": int(FIXED_EPOCHS),
+            "val_mse": val_final["mse"],
+            "val_mae": val_final["mae"],
+        }
+        print(
+            f"{name}: val_mae={results[name]['val_mae']:.4f}"
+        )
 
     labels = list(results.keys())
-    mae_vals = [results[k]["val_mae"] for k in labels]
+    val_mae_vals = [results[k]["val_mae"] for k in labels]
     colors = ["#4a90e2", "#50e3c2", "#f5a623", "#bd10e0", "#7ed321"]
     plt.figure(figsize=(8, 4))
-    plt.bar(labels, mae_vals, color=colors[: len(labels)])
+    plt.bar(labels, val_mae_vals, color=colors[: len(labels)])
     plt.ylabel("Validation MAE")
-    plt.title("Model comparison")
+    plt.title("Model comparison (val)")
     plt.tight_layout()
     plt.savefig(fig_dir / "model_val_mae.png")
     plt.close()
@@ -370,14 +369,13 @@ def run_compare(train_path: Path, allow_unsafe: bool, out_dir: Path, epochs: int
 
 def main():
     ap = argparse.ArgumentParser(description="Compare model architectures for positioning.")
-    ap.add_argument("--train-path", default="train_data-s02-80-20-seq1.pt")
-    ap.add_argument("--output-dir", default="artifacts/model_compare")
+    ap.add_argument("--train-path", default=str(TRAIN_PT_PATH))
+    ap.add_argument("--output-dir", default=str(OUT_DIR))
     ap.add_argument("--allow-unsafe", action="store_true")
-    ap.add_argument("--epochs", type=int, default=10)
     args = ap.parse_args()
 
     out_dir = Path(args.output_dir)
-    run_compare(Path(args.train_path), args.allow_unsafe, out_dir, epochs=args.epochs)
+    run_compare(Path(args.train_path), args.allow_unsafe, out_dir)
 
 
 if __name__ == "__main__":

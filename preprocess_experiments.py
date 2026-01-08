@@ -14,6 +14,21 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
+
+# =====================
+# Fixed paths (combined dataset)
+# =====================
+PROJECT_ROOT = Path(__file__).resolve().parent
+DATASET_DIR = PROJECT_ROOT / "Dataset"
+TRAIN_PT_PATH = DATASET_DIR / "train_combined.pt"
+TEST_PT_PATH = DATASET_DIR / "test_combined.pt"
+
+# All outputs go under FigData
+OUT_DIR = PROJECT_ROOT / "FigData" / "PreprocessExperiments" / "combined"
+
+# Repeat runs to reduce split randomness.
+SEEDS = [42, 43, 44]
+
 FIELD_SLICES: Dict[str, Tuple[int, int]] = {
     "g1_pos": (0, 3),
     "g2_pos": (3, 6),
@@ -57,12 +72,6 @@ def split_fields(tensor: torch.Tensor) -> Dict[str, torch.Tensor]:
 def compute_stats(train_fields: Dict[str, torch.Tensor]) -> dict:
     # 计算多种统计（均值/方差/分位）供不同归一化策略使用
     stats: dict = {}
-    g_pos = torch.cat([train_fields["g1_pos"], train_fields["g2_pos"], train_fields["g3_pos"]], dim=1)
-    stats["g_pos_mean"] = g_pos.mean(dim=0)
-    stats["g_pos_std"] = g_pos.std(dim=0).clamp(min=1e-6)
-    stats["g_pos_min"] = g_pos.min(dim=0).values
-    stats["g_pos_max"] = g_pos.max(dim=0).values
-
     ts = train_fields["timestamp"]
     stats["ts_mean"] = ts.mean(dim=0)
     stats["ts_std"] = ts.std(dim=0).clamp(min=1e-6)
@@ -90,7 +99,6 @@ def build_features(fields: Dict[str, torch.Tensor], stats: dict, strategy: str) 
         return torch.cat([g_pos, ts] + specs, dim=1)
 
     if strategy == "block_zscore":
-        g_pos = (g_pos - stats["g_pos_mean"]) / stats["g_pos_std"]
         ts = (ts - stats["ts_mean"]) / stats["ts_std"]
         norm_specs = []
         for i, s in enumerate(specs):
@@ -100,8 +108,6 @@ def build_features(fields: Dict[str, torch.Tensor], stats: dict, strategy: str) 
         return torch.cat([g_pos, ts] + norm_specs, dim=1)
 
     if strategy == "robust":
-        g_pos = torch.clamp(g_pos, 0.0, 1.0)
-        g_pos = (g_pos - stats["g_pos_min"]) / (stats["g_pos_max"] - stats["g_pos_min"] + 1e-6)
         ts = (ts - stats["ts_min"]) / (stats["ts_max"] - stats["ts_min"] + 1e-6)
         norm_specs = []
         for i, s in enumerate(specs):
@@ -127,11 +133,11 @@ class PairDataset(Dataset):
         return self.features[idx], self.targets[idx]
 
 
-def make_loaders(features: torch.Tensor, targets: torch.Tensor, batch_size: int = 64):
+def make_loaders(features: torch.Tensor, targets: torch.Tensor, batch_size: int = 64, seed: int = 42):
     # 固定种子划分 8:2 训练/验证
     N = features.size(0)
     val_size = int(0.2 * N)
-    idx = torch.randperm(N, generator=torch.Generator().manual_seed(42))
+    idx = torch.randperm(N, generator=torch.Generator().manual_seed(seed))
     val_idx = idx[:val_size]
     train_idx = idx[val_size:]
     train_ds = PairDataset(features[train_idx], targets[train_idx])
@@ -158,14 +164,43 @@ class SimpleRegressor(nn.Module):
         return self.net(x)
 
 
-def train_one(features: torch.Tensor, targets: torch.Tensor, epochs: int = 5, lr: float = 1e-3, batch_size: int = 64):
-    # 用简单 MLP 快速验证不同预处理的效果，返回验证集 MSE/MAE
-    loader_train, loader_val = make_loaders(features, targets, batch_size=batch_size)
+def evaluate_model(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict[str, float]:
+    loss_fn = nn.MSELoss()
+    model.eval()
+    mse_sum = 0.0
+    mae_sum = 0.0
+    n = 0
+    with torch.no_grad():
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            pred = model(x)
+            mse_sum += loss_fn(pred, y).item() * x.size(0)
+            mae_sum += (pred - y).abs().mean().item() * x.size(0)
+            n += x.size(0)
+    return {"mse": mse_sum / n, "mae": mae_sum / n}
+
+
+def train_one(
+    features: torch.Tensor,
+    targets: torch.Tensor,
+    test_features: torch.Tensor,
+    test_targets: torch.Tensor,
+    epochs: int = 5,
+    lr: float = 1e-3,
+    batch_size: int = 64,
+    seed: int = 42,
+):
+    """训练一个小 MLP，返回 val 与 test 的 MSE/MAE。"""
+
+    loader_train, loader_val = make_loaders(features, targets, batch_size=batch_size, seed=seed)
+    loader_test = DataLoader(PairDataset(test_features, test_targets), batch_size=batch_size, shuffle=False)
+
     model = SimpleRegressor(features.size(1))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn = nn.MSELoss()
+
     best_state = None
     best_val = math.inf
 
@@ -178,47 +213,37 @@ def train_one(features: torch.Tensor, targets: torch.Tensor, epochs: int = 5, lr
             loss = loss_fn(pred, y)
             loss.backward()
             opt.step()
-        model.eval()
-        mse_sum = 0.0
-        mae_sum = 0.0
-        n = 0
-        with torch.no_grad():
-            for x, y in loader_val:
-                x, y = x.to(device), y.to(device)
-                pred = model(x)
-                mse_sum += loss_fn(pred, y).item() * x.size(0)
-                mae_sum += (pred - y).abs().mean().item() * x.size(0)
-                n += x.size(0)
-        val_mse = mse_sum / n
-        if val_mse < best_val:
-            best_val = val_mse
+        val_metrics = evaluate_model(model, loader_val, device)
+        if val_metrics["mse"] < best_val:
+            best_val = val_metrics["mse"]
             best_state = model.state_dict()
-    model.load_state_dict(best_state)
-    # final metrics
-    model.eval()
-    mse_sum = 0.0
-    mae_sum = 0.0
-    n = 0
-    with torch.no_grad():
-        for x, y in loader_val:
-            x, y = x.to(device), y.to(device)
-            pred = model(x)
-            mse_sum += loss_fn(pred, y).item() * x.size(0)
-            mae_sum += (pred - y).abs().mean().item() * x.size(0)
-            n += x.size(0)
-    return {"val_mse": mse_sum / n, "val_mae": mae_sum / n}
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    val_final = evaluate_model(model, loader_val, device)
+    test_final = evaluate_model(model, loader_test, device)
+    return {
+        "val_mse": val_final["mse"],
+        "val_mae": val_final["mae"],
+        "test_mse": test_final["mse"],
+        "test_mae": test_final["mae"],
+    }
 
 
 def run_experiments(train_path: Path, test_path: Path, allow_unsafe: bool, out_dir: Path):
-    # 跑三种预处理策略，比较验证 MAE，并保存柱状图与指标 JSON
+    # 跑三种预处理策略，比较验证/测试 MAE，并保存柱状图与指标 JSON
     out_dir.mkdir(parents=True, exist_ok=True)
     fig_dir = out_dir / "figs"
     fig_dir.mkdir(exist_ok=True)
 
     train_tensor = safe_load(train_path, allow_unsafe=allow_unsafe)
-    _ = safe_load(test_path, allow_unsafe=allow_unsafe)  # kept for symmetry
+    test_tensor = safe_load(test_path, allow_unsafe=allow_unsafe)
+
     train_fields = split_fields(train_tensor)
+    test_fields = split_fields(test_tensor)
     targets = train_fields["gt_pos"][:, :2]
+    test_targets = test_fields["gt_pos"][:, :2]
 
     stats = compute_stats(train_fields)
     strategies = ["raw", "block_zscore", "robust"]
@@ -226,31 +251,69 @@ def run_experiments(train_path: Path, test_path: Path, allow_unsafe: bool, out_d
 
     for name in strategies:
         feats = build_features(train_fields, stats, strategy=name)
-        metrics = train_one(feats, targets, epochs=5)
-        results[name] = metrics
-        print(f"{name}: val_mse={metrics['val_mse']:.4f}, val_mae={metrics['val_mae']:.4f}")
+        test_feats = build_features(test_fields, stats, strategy=name)
+
+        per_seed = []
+        for seed in SEEDS:
+            metrics = train_one(feats, targets, test_feats, test_targets, epochs=5, seed=seed)
+            per_seed.append({"seed": seed, **metrics})
+
+        val_mae = torch.tensor([m["val_mae"] for m in per_seed], dtype=torch.float32)
+        test_mae = torch.tensor([m["test_mae"] for m in per_seed], dtype=torch.float32)
+        val_mse = torch.tensor([m["val_mse"] for m in per_seed], dtype=torch.float32)
+        test_mse = torch.tensor([m["test_mse"] for m in per_seed], dtype=torch.float32)
+
+        results[name] = {
+            "seeds": SEEDS,
+            "per_seed": per_seed,
+            "val_mae_mean": float(val_mae.mean().item()),
+            "val_mae_std": float(val_mae.std(unbiased=False).item()),
+            "val_mse_mean": float(val_mse.mean().item()),
+            "val_mse_std": float(val_mse.std(unbiased=False).item()),
+            "test_mae_mean": float(test_mae.mean().item()),
+            "test_mae_std": float(test_mae.std(unbiased=False).item()),
+            "test_mse_mean": float(test_mse.mean().item()),
+            "test_mse_std": float(test_mse.std(unbiased=False).item()),
+        }
+
+        print(
+            f"{name}: val_mae={results[name]['val_mae_mean']:.4f}±{results[name]['val_mae_std']:.4f}, "
+            f"test_mae={results[name]['test_mae_mean']:.4f}±{results[name]['test_mae_std']:.4f}"
+        )
 
     labels = list(results.keys())
-    mae_vals = [results[k]["val_mae"] for k in labels]
+
+    val_mae_vals = [results[k]["val_mae_mean"] for k in labels]
+    val_mae_err = [results[k]["val_mae_std"] for k in labels]
     plt.figure(figsize=(6, 4))
-    plt.bar(labels, mae_vals, color=["#4a90e2", "#50e3c2", "#f5a623"])
+    plt.bar(labels, val_mae_vals, yerr=val_mae_err, capsize=4, color=["#4a90e2", "#50e3c2", "#f5a623"])
     plt.ylabel("Validation MAE")
-    plt.title("Preprocessing strategy comparison")
+    plt.title("Preprocessing strategy comparison (val)")
     plt.tight_layout()
     plt.savefig(fig_dir / "val_mae_comparison.png")
+    plt.close()
+
+    test_mae_vals = [results[k]["test_mae_mean"] for k in labels]
+    test_mae_err = [results[k]["test_mae_std"] for k in labels]
+    plt.figure(figsize=(6, 4))
+    plt.bar(labels, test_mae_vals, yerr=test_mae_err, capsize=4, color=["#4a90e2", "#50e3c2", "#f5a623"])
+    plt.ylabel("Test MAE")
+    plt.title("Preprocessing strategy comparison (test)")
+    plt.tight_layout()
+    plt.savefig(fig_dir / "test_mae_comparison.png")
     plt.close()
 
     with open(out_dir / "preprocess_metrics.json", "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
 
-    return results, fig_dir / "val_mae_comparison.png"
+    return results, fig_dir / "val_mae_comparison.png", fig_dir / "test_mae_comparison.png"
 
 
 def main():
     ap = argparse.ArgumentParser(description="Run preprocessing experiments.")
-    ap.add_argument("--train-path", default="train_data-s02-80-20-seq1.pt")
-    ap.add_argument("--test-path", default="test_data-s02-80-20-seq1.pt")
-    ap.add_argument("--output-dir", default="artifacts/preprocess")
+    ap.add_argument("--train-path", default=str(TRAIN_PT_PATH))
+    ap.add_argument("--test-path", default=str(TEST_PT_PATH))
+    ap.add_argument("--output-dir", default=str(OUT_DIR))
     ap.add_argument("--allow-unsafe", action="store_true")
     args = ap.parse_args()
 
