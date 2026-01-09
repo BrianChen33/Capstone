@@ -1,5 +1,5 @@
-"""Training script with block-wise z-score preprocessing.
-Uses an MLP backbone (recommended winner from model comparison).
+"""使用逐块 Z-score 预处理的训练脚本。
+使用 MLP 主干网络（模型对比中的推荐胜出者）。
 """
 import argparse
 import inspect
@@ -13,7 +13,7 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
 
-# Field layout
+# 字段布局
 FIELD_SLICES: Dict[str, Tuple[int, int]] = {
     "g1_pos": (0, 3),
     "g2_pos": (3, 6),
@@ -302,7 +302,7 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device):
 def save_stats(stats: dict, path: str):
     # 统计包含 tensor，需转 list 才能 JSON 序列化
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    # tensors to list
+    # 将 tensor 转换为 list
     serializable = {k: (v.tolist() if torch.is_tensor(v) else v) for k, v in stats.items()}
     with open(path, "w", encoding="utf-8") as f:
         json.dump(serializable, f, indent=2)
@@ -315,7 +315,7 @@ def save_report(path: str, content: dict):
 
 
 def main():
-    # 入口：加载数据 → 预处理 → 划分 → 训练 → 测试 → 落盘模型与统计
+    # 加载数据 → 预处理 → 划分 → 训练 → 测试 → 落盘模型与统计
     parser = argparse.ArgumentParser(description="Train positioning models with block-wise z-score.")
     parser.add_argument("--train-path", required=True)
     parser.add_argument("--test-path", required=True)
@@ -346,7 +346,7 @@ def main():
     model = build_model(args.model, flat_dim=flat_train.size(1), meta_dim=meta_train.size(1)).to(device)
     train_model(model, loaders, device=device, epochs=args.epochs, lr=args.lr)
 
-    # test metrics
+    # 测试指标
     test_loader = DataLoader(PositionDataset(flat_test, seq_test, meta_test, y_test), batch_size=args.batch_size)
     test_metrics = evaluate(model, test_loader, device)
     print(f"Test mse: {test_metrics['mse']:.4f}, test mae: {test_metrics['mae']:.4f}")

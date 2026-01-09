@@ -1,13 +1,13 @@
-"""Utilities to (1) check whether g2/g3 fields are effectively identical, and (2) export .pt tensors to CSV.
+"""工具脚本：(1) 检查 g2/g3 字段是否实际上完全相同；(2) 将 .pt 张量导出为 CSV。
 
-Usage examples (PowerShell):
-    # Check g2/g3 similarity on both train and test
+用法示例 (PowerShell):
+    # 检查训练集和测试集上的 g2/g3 相似性
     python verify_and_export.py --train-path train_data-s02-80-20-seq1.pt --test-path test_data-s02-80-20-seq1.pt
 
-    # Also check spectral fields
+    # 同时检查频谱字段
     python verify_and_export.py --train-path train_data-s02-80-20-seq1.pt --check-spec
 
-    # Export a tensor to CSV
+    # 导出 Zhang量为 CSV
     python verify_and_export.py --pt-path train_data-s02-80-20-seq1.pt --csv-out artifacts/train.csv
 """
 import argparse

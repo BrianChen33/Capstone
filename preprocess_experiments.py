@@ -1,5 +1,5 @@
-"""Preprocessing experiments for Bluetooth positioning dataset.
-Compares normalization strategies with quick validation metrics.
+"""蓝牙定位数据及预处理实验。
+通过快速验证指标比较归一化策略。
 """
 import argparse
 import inspect
@@ -16,17 +16,17 @@ from torch.utils.data import DataLoader, Dataset
 
 
 # =====================
-# Fixed paths (combined dataset)
+# 固定路径（合并数据集）
 # =====================
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATASET_DIR = PROJECT_ROOT / "Dataset"
 TRAIN_PT_PATH = DATASET_DIR / "train_combined.pt"
 TEST_PT_PATH = DATASET_DIR / "test_combined.pt"
 
-# All outputs go under FigData
+# 所有输出都在 FigData 目录下
 OUT_DIR = PROJECT_ROOT / "FigData" / "PreprocessExperiments" / "combined"
 
-# Repeat runs to reduce split randomness.
+# 多次运行以减少拆分随机性。
 SEEDS = [42, 43, 44]
 
 FIELD_SLICES: Dict[str, Tuple[int, int]] = {

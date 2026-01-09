@@ -47,7 +47,7 @@ def main():
     if isinstance(obj, torch.Tensor):
         out["content"] = summarize_tensor(obj)
         print(json.dumps(out, indent=2))
-        # show a few rows if shape[0] exists
+        # 如果 shape[0] 存在，展示前若干行
         if obj.dim() >= 1:
             n = min(args.show_samples, obj.shape[0])
             print(f"\nFirst {n} rows (as numpy):\n", obj[:n].numpy())
@@ -59,7 +59,7 @@ def main():
             else:
                 out["keys"][k] = {"type": type(v).__name__}
         print(json.dumps(out, indent=2))
-        # optionally save tensor dict to npz
+        # 可选：将张量字典保存为 npz
         if args.save_npz:
             npz = {}
             for k, v in obj.items():
@@ -68,7 +68,7 @@ def main():
             np.savez(args.save_npz, **npz)
             print(f"Saved tensors to {args.save_npz}")
     else:
-        # fallback: print repr summary
+        # 回退：打印 repr 摘要
         out["repr_len"] = len(repr(obj))
         print(json.dumps(out, indent=2))
         print("Top-level repr (truncated):")

@@ -17,14 +17,14 @@ import torch
 
 
 # =====================
-# Fixed paths (combined dataset)
+# 固定路径（合并数据集）
 # =====================
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATASET_DIR = PROJECT_ROOT / "Dataset"
 TRAIN_PT_PATH = DATASET_DIR / "train_combined.pt"
 TEST_PT_PATH = DATASET_DIR / "test_combined.pt"
 
-# All outputs go under FigData (as required by the report)
+# 所有输出都在 FigData 目录下（根据报告要求）
 OUT_DIR = PROJECT_ROOT / "FigData" / "ExploreDataset" / "combined"
 
 

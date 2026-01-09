@@ -1,9 +1,9 @@
-"""Model comparison experiments (MLP vs CNN vs Transformer) on Bluetooth positioning.
-Uses the report's standard preprocessing: block-wise z-score computed on the training split only.
+"""蓝牙定位的模型对比实验（MLP vs CNN vs Transformer）。
+使用报告的标准预处理：仅在训练拆分上计算的分块 Z-score。
 
-Note: This script is intentionally configured for a short, fixed-budget comparison:
-- Fixed learning rate (no sweep)
-- Fixed epochs (6)
+注意：此脚本特意配置为进行简短的固定预算比较：
+- 固定学习率（无扫描）
+- 固定 epoch 数（6）
 """
 import argparse
 import inspect
@@ -20,18 +20,18 @@ from torch.utils.data import DataLoader, Dataset
 
 
 # =====================
-# Fixed paths (combined dataset)
+# 固定路径（合并数据集）
 # =====================
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATASET_DIR = PROJECT_ROOT / "Dataset"
 TRAIN_PT_PATH = DATASET_DIR / "train_combined.pt"
 
-# Fixed training budget (per report)
+# 固定训练预算（根据报告）
 FIXED_LR = 1e-3
 FIXED_EPOCHS = 6
 FIXED_SEED = 42
 
-# All outputs go under FigData
+# 所有输出都在 FigData 目录下
 OUT_DIR = PROJECT_ROOT / "FigData" / "ModelCompare" / "combined"
 
 
@@ -193,7 +193,7 @@ class CNNRegressor(nn.Module):
 
 
 class PositionalEncoding(nn.Module):
-    """Learnable positional embedding for sequences."""
+    """序列的可学习位置嵌入。"""
 
     def __init__(self, d_model: int, max_len: int = 512):
         super().__init__()
@@ -221,7 +221,7 @@ class TransformerRegressor(nn.Module):
         )
 
     def forward(self, flat_feats, spec_seq, meta):
-        # Treat meta as a dedicated token to guide attention under a short training budget.
+        # 将 meta 视为专用 token，以便在较短的训练预算下引导注意力。
         spec_tokens = self.input_proj(spec_seq)  # (B, 324, d_model)
         meta_token = self.meta_proj(meta).unsqueeze(1)  # (B, 1, d_model)
         x = torch.cat([meta_token, spec_tokens], dim=1)  # (B, 325, d_model)
@@ -321,7 +321,7 @@ def run_compare(train_path: Path, allow_unsafe: bool, out_dir: Path):
     meta_dim = meta_train.size(1)
     flat_dim = flat_train.size(1)
 
-    # Keep the comparison aligned with the report: MLP vs CNN vs Transformer.
+    # 保持对比与报告一致：MLP vs CNN vs Transformer。
     model_factories = {
         "mlp": lambda: MLPRegressor(flat_dim),
         "cnn": lambda: CNNRegressor(meta_dim=meta_dim),
@@ -337,7 +337,7 @@ def run_compare(train_path: Path, allow_unsafe: bool, out_dir: Path):
         model = factory()
         _ = train_model(model, loaders, epochs=FIXED_EPOCHS, lr=FIXED_LR)
         model.to(device)
-        # Recompute val metrics on the final best model (device-aware)
+        # 在最终最佳模型上重新计算验证指标（感知设备）
         _, val_loader = loaders
         val_final = evaluate_on_loader(model, val_loader, device)
         results[name] = {
