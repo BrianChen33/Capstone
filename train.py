@@ -1,5 +1,5 @@
 """使用逐块 Z-score 预处理的训练脚本。
-使用 MLP 主干网络（模型对比中的推荐胜出者）。
+使用 Transformer 主干网络（模型对比中的推荐胜出者）。
 """
 import argparse
 import inspect
@@ -319,7 +319,7 @@ def main():
     parser = argparse.ArgumentParser(description="Train positioning models with block-wise z-score.")
     parser.add_argument("--train-path", required=True)
     parser.add_argument("--test-path", required=True)
-    parser.add_argument("--model", default="mlp", choices=["mlp", "cnn", "transformer"], help="Backbone")
+    parser.add_argument("--model", default="transformer", choices=["mlp", "cnn", "transformer"], help="Backbone")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=6)
     parser.add_argument("--lr", type=float, default=1e-3)
