@@ -5,15 +5,16 @@
 """
 
 import argparse
+import inspect
 import json
+import warnings
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from shared import FIELD_SLICES, safe_load, split_fields
 
 # =====================
 # 固定路径（合并数据集）
@@ -25,6 +26,53 @@ TEST_PT_PATH = DATASET_DIR / "test_combined.pt"
 
 # 所有输出都在 FigData 目录下（根据报告要求）
 OUT_DIR = PROJECT_ROOT / "FigData" / "ExploreDataset" / "combined"
+
+
+# 数据布局：g1_pos(3) + g2_pos(3) + g3_pos(3) + timestamp(1) + area(1) + gt_pos(3)
+#         + g1_spec(324) + g2_spec(324) + g3_spec(324) = 986
+FIELD_SLICES: Dict[str, Tuple[int, int]] = {
+    "g1_pos": (0, 3),
+    "g2_pos": (3, 6),
+    "g3_pos": (6, 9),
+    "timestamp": (9, 10),
+    "area": (10, 11),
+    "gt_pos": (11, 14),
+    "g1_spec": (14, 14 + 324),
+    "g2_spec": (14 + 324, 14 + 648),
+    "g3_spec": (14 + 648, 14 + 972),
+}
+
+
+def _supports_weights_only() -> bool:
+    """检查 torch.load 是否支持 weights_only 参数。"""
+
+    return "weights_only" in inspect.signature(torch.load).parameters
+
+
+def safe_load(path: Path, allow_unsafe: bool) -> torch.Tensor:
+    """带 weights_only 的安全加载包装。"""
+
+    try:
+        if _supports_weights_only():
+            return torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        # 某些 PyTorch 版本不支持 weights_only
+        pass
+    if not allow_unsafe:
+        raise RuntimeError(
+            "Current PyTorch does not support weights_only=True; rerun with --allow-unsafe if you trust the file."
+        )
+    warnings.warn("Loading without weights_only=True; only do this for trusted files.")
+    return torch.load(path, map_location="cpu")
+
+
+def split_fields(tensor: torch.Tensor) -> Dict[str, torch.Tensor]:
+    """拆分 [N, 1, 986] 张量为字段字典。"""
+
+    if tensor.dim() != 3 or tensor.size(1) != 1:
+        raise ValueError("Expected tensor shape [N,1,F].")
+    flat = tensor[:, 0, :]
+    return {name: flat[:, sl[0] : sl[1]] for name, sl in FIELD_SLICES.items()}
 
 
 def summarize_numeric(data: torch.Tensor) -> Dict[str, float]:
@@ -197,30 +245,6 @@ def summarize_split(name: str, tensor: torch.Tensor) -> Dict[str, Dict]:
     }
 
 
-def plot_spectrum_range(split: str, g_specs: Dict[str, torch.Tensor], out_path: Path) -> None:
-    """Verify that spatial spectra are bounded in [0, 1].
-
-    This plot justifies the decision to skip spectrum normalisation.
-    """
-    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
-    for ax, (name, tensor) in zip(axes, g_specs.items()):
-        vals = tensor.detach().cpu().numpy().flatten()
-        ax.hist(vals, bins=60, color="#2980b9", alpha=0.75, edgecolor="white")
-        ax.axvline(0, color="red", ls="--", lw=1, label="0")
-        ax.axvline(1, color="red", ls="--", lw=1, label="1")
-        ax.set_title(f"{split}: {name} value range")
-        ax.set_xlabel("spectrum value")
-        ax.set_ylabel("count")
-        ax.legend()
-        ax.text(0.95, 0.95,
-                f"min={vals.min():.4f}\nmax={vals.max():.4f}\nmean={vals.mean():.4f}",
-                transform=ax.transAxes, ha="right", va="top", fontsize=8,
-                bbox=dict(boxstyle="round", fc="wheat", alpha=0.5))
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=150)
-    plt.close()
-
-
 def render_figures(split: str, fields: Dict[str, torch.Tensor], fig_dir: Path) -> None:
     """针对单个数据切分生成全部图表。"""
 
@@ -228,13 +252,13 @@ def render_figures(split: str, fields: Dict[str, torch.Tensor], fig_dir: Path) -
     g_specs = {k: fields[k] for k in ["g1_spec", "g2_spec", "g3_spec"]}
     gateway_pos = {k: fields[k] for k in ["g1_pos", "g2_pos", "g3_pos"]}
 
+    # Put train/test figures into separate folders and use consistent filenames.
     plot_ground_truth_xy(split, fields["gt_pos"], fields["timestamp"], fig_dir / "ground_truth_xy.png")
     plot_timestamp_hist(split, fields["timestamp"], fig_dir / "timestamp_hist.png")
     plot_area_bar(split, fields["area"], fig_dir / "area_bar.png")
     plot_gt_hist(split, fields["gt_pos"], fig_dir / "gt_hist.png")
     plot_spectrum_energy(split, g_specs, fig_dir / "spectrum_energy.png")
     plot_distance_vs_energy(split, fields["gt_pos"], gateway_pos, g_specs, fig_dir / "distance_vs_energy.png")
-    plot_spectrum_range(split, g_specs, fig_dir / "spectrum_range.png")
 
 
 def main() -> None:

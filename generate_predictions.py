@@ -1,29 +1,31 @@
 #!/usr/bin/env python3
-"""Generate prediction .npy files from trained model for error_analysis and visualization."""
-import inspect, json, os, warnings
+"""Generate prediction .npy files from the trained model for downstream analysis."""
+import json
+import os
+
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-# Reuse train.py helpers
-from train import (
-    FIELD_SLICES, safe_load, split_fields, compute_stats,
-    preprocess_block_zscore, PositionDataset, build_model,
+from shared import (
+    DEVICE, safe_load, split_fields, compute_stats,
+    preprocess, PositionDataset,
 )
+from models import build_model
 
 
 def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = DEVICE
+    print(f"Using device: {device}")
 
-    # Load data
+    # Load & preprocess
     train_tensor = safe_load("Dataset/train_combined.pt", allow_unsafe=True)
     test_tensor = safe_load("Dataset/test_combined.pt", allow_unsafe=True)
-
     train_fields = split_fields(train_tensor)
     test_fields = split_fields(test_tensor)
 
     stats = compute_stats(train_fields)
-    flat_test, seq_test, meta_test, y_test = preprocess_block_zscore(test_fields, stats)
+    flat_test, seq_test, meta_test, y_test = preprocess(test_fields, stats)
 
     # Load trained model
     with open("artifacts/training_report.json") as f:
@@ -35,66 +37,62 @@ def main():
     model.eval()
 
     # Predict
-    test_ds = PositionDataset(flat_test, seq_test, meta_test, y_test)
-    loader = DataLoader(test_ds, batch_size=256, shuffle=False)
-
+    loader = DataLoader(
+        PositionDataset(flat_test, seq_test, meta_test, y_test),
+        batch_size=256, shuffle=False,
+    )
     all_preds, all_targets = [], []
     with torch.no_grad():
         for flat_feats, spec_seq, meta, y in loader:
-            flat_feats = flat_feats.to(device)
-            spec_seq = spec_seq.to(device)
-            meta = meta.to(device)
-            pred = model(flat_feats, spec_seq, meta)
+            pred = model(flat_feats.to(device), spec_seq.to(device), meta.to(device))
             all_preds.append(pred.cpu().numpy())
-            all_targets.append(y.cpu().numpy())
+            all_targets.append(y.numpy())
 
-    preds = np.concatenate(all_preds, axis=0)
-    targets = np.concatenate(all_targets, axis=0)
-
-    # Also get timestamps for temporal analysis
+    preds = np.concatenate(all_preds)
+    targets = np.concatenate(all_targets)
     timestamps = test_fields["timestamp"].numpy().flatten()
 
+    # Pad to 3D (x, y, z=0) for visualize_enhanced.py compatibility
+    preds3d = np.column_stack([preds, np.zeros(len(preds))])
+    targets3d = np.column_stack([targets, np.zeros(len(targets))])
+
     out_dir = "artifacts"
-    np.save(os.path.join(out_dir, "test_predictions.npy"), preds)
-    np.save(os.path.join(out_dir, "test_targets.npy"), targets)
+    np.save(os.path.join(out_dir, "test_predictions.npy"), preds3d)
+    np.save(os.path.join(out_dir, "test_targets.npy"), targets3d)
     np.save(os.path.join(out_dir, "test_timestamps.npy"), timestamps)
 
-    # Compute detailed metrics
+    # Metrics
     errors = np.sqrt(np.sum((preds - targets) ** 2, axis=1))
-    print(f"Samples: {len(errors)}")
-    print(f"MAE (Euclidean): {errors.mean():.4f} m")
-    print(f"MSE: {np.mean(np.sum((preds - targets) ** 2, axis=1)):.4f}")
-    print(f"RMSE: {np.sqrt(np.mean(np.sum((preds - targets) ** 2, axis=1))):.4f} m")
-    print(f"Median Error: {np.median(errors):.4f} m")
-    print(f"Std Error: {np.std(errors):.4f} m")
-    print(f"90th Percentile: {np.percentile(errors, 90):.4f} m")
-    print(f"95th Percentile: {np.percentile(errors, 95):.4f} m")
-    print(f"Within 0.3m: {100*np.mean(errors < 0.3):.1f}%")
-    print(f"Within 0.5m: {100*np.mean(errors < 0.5):.1f}%")
-    print(f"Within 1.0m: {100*np.mean(errors < 1.0):.1f}%")
-
-    # Distance bucketing
-    buckets = [(0, 0.3), (0.3, 0.5), (0.5, 1.0), (1.0, 2.0), (2.0, float('inf'))]
-    bucket_labels = ['0-0.3m', '0.3-0.5m', '0.5-1.0m', '1.0-2.0m', '>2.0m']
-    print("\nError Distribution by Buckets:")
-    for (lo, hi), label in zip(buckets, bucket_labels):
-        mask = (errors >= lo) & (errors < hi)
-        count = mask.sum()
-        pct = 100 * count / len(errors)
-        avg = errors[mask].mean() if count > 0 else 0
-        print(f"  {label}: count={count}, pct={pct:.1f}%, avg_error={avg:.4f}m")
-
-    # Per-axis errors
     x_err = np.abs(preds[:, 0] - targets[:, 0])
     y_err = np.abs(preds[:, 1] - targets[:, 1])
-    print(f"\nPer-axis MAE: X={x_err.mean():.4f}m, Y={y_err.mean():.4f}m")
 
-    # Save comprehensive metrics
+    print(f"Samples: {len(errors)}")
+    print(f"MAE (Euclidean): {errors.mean():.4f} m")
+    print(f"RMSE: {np.sqrt(np.mean(errors ** 2)):.4f} m")
+    print(f"Median Error: {np.median(errors):.4f} m")
+    print(f"90th Percentile: {np.percentile(errors, 90):.4f} m")
+    print(f"95th Percentile: {np.percentile(errors, 95):.4f} m")
+    print(f"Within 0.3m: {100 * np.mean(errors < 0.3):.1f}%")
+    print(f"Within 0.5m: {100 * np.mean(errors < 0.5):.1f}%")
+    print(f"Within 1.0m: {100 * np.mean(errors < 1.0):.1f}%")
+    print(f"Per-axis MAE: X={x_err.mean():.4f}m, Y={y_err.mean():.4f}m")
+
+    # Bucketing
+    buckets = [(0, 0.3), (0.3, 0.5), (0.5, 1.0), (1.0, 2.0), (2.0, float("inf"))]
+    labels = ["0-0.3m", "0.3-0.5m", "0.5-1.0m", "1.0-2.0m", ">2.0m"]
+    print("\nError Distribution:")
+    for (lo, hi), lab in zip(buckets, labels):
+        mask = (errors >= lo) & (errors < hi)
+        cnt = mask.sum()
+        pct = 100 * cnt / len(errors)
+        avg = errors[mask].mean() if cnt > 0 else 0
+        print(f"  {lab}: count={cnt}, pct={pct:.1f}%, avg={avg:.4f}m")
+
     metrics = {
         "num_samples": int(len(errors)),
         "mae_euclidean": float(errors.mean()),
-        "mse": float(np.mean(np.sum((preds - targets) ** 2, axis=1))),
-        "rmse": float(np.sqrt(np.mean(np.sum((preds - targets) ** 2, axis=1)))),
+        "mse": float(np.mean(errors ** 2)),
+        "rmse": float(np.sqrt(np.mean(errors ** 2))),
         "median_error": float(np.median(errors)),
         "std_error": float(np.std(errors)),
         "p90": float(np.percentile(errors, 90)),
