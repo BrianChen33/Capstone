@@ -24,8 +24,8 @@ Usage:
     python visualize_enhanced.py --npz-file results.npz --viz-type all
     python visualize_enhanced.py --csv results.csv --viz-type 3d_trajectory
 
-Author: COMP4913 Capstone Project Team
-Date: 2024
+E.g.
+c:\Users\chenb\Desktop\个人资料\nextjs-dashboard\Capstone\.venv\Scripts\python.exe c:/Users/chenb/Desktop/个人资料/nextjs-dashboard/Capstone/visualize_enhanced.py -p artifacts/test_predictions.npy -t artifacts/test_targets.npy --viz-type all
 """
 
 import os
@@ -55,7 +55,7 @@ plt.rcParams['figure.dpi'] = 100
 # Constants
 DATASET_DIR = './Dataset/'
 FIGDATA_DIR = './FigData/'
-OUTPUT_DIR = './output/visualization/'
+OUTPUT_DIR = './FigData/Visualization/'
 RANDOM_SEED = 42
 
 
@@ -326,8 +326,8 @@ def plot_3d_trajectory(
     # Add statistics text
     error_stats = calculate_errors(predictions, targets)
     stats_text = f"MDE: {error_stats['mde']:.3f}m\nRMSE: {np.mean(error_stats['rmse']):.3f}m"
-    ax.text2D(0.02, 0.98, stats_text, transform=ax.transAxes,
-              fontsize=9, verticalalignment='top',
+    ax.text2D(0.02, 0.02, stats_text, transform=ax.transAxes,
+              fontsize=9, verticalalignment='bottom',
               bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
     plt.tight_layout()
