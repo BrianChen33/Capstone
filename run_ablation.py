@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Ablation study — evaluates feature-group importance by zeroing out components.
 
-Uses MLP for speed; the goal is *relative* importance, not absolute accuracy.
-Reuses the shared preprocessing and training utilities.
+Uses MLP on combined cross-scene data for speed; the goal is *relative*
+importance, not absolute accuracy. Reuses the shared preprocessing and
+training utilities.
 """
 import json
 import os
@@ -11,8 +12,9 @@ import torch
 from torch.utils.data import DataLoader
 
 from shared import (
-    DEVICE, safe_load, split_fields, compute_stats,
+    DEVICE, split_fields, compute_stats,
     preprocess, PositionDataset, make_loaders,
+    SCENE_IDS, load_all_scenes, combine_scene_tensors,
 )
 from models import build_model
 from train import train_model, evaluate
@@ -46,19 +48,12 @@ def zero_columns(t, cols):
     return t
 
 
-def main():
-    torch.manual_seed(SEED)
-    device = DEVICE
-    print(f"Using device: {device}")
-
-    train_tensor = safe_load("Dataset/train_combined.pt", allow_unsafe=True)
-    test_tensor = safe_load("Dataset/test_combined.pt", allow_unsafe=True)
-    train_fields = split_fields(train_tensor)
-    test_fields = split_fields(test_tensor)
-    stats = compute_stats(train_fields)
-
-    flat_tr, seq_tr, meta_tr, y_tr = preprocess(train_fields, stats)
-    flat_te, seq_te, meta_te, y_te = preprocess(test_fields, stats)
+def run_ablation(flat_tr, seq_tr, meta_tr, y_tr,
+                 flat_te, seq_te, meta_te, y_te):
+    """Run ablation study on combined data."""
+    print(f"\n{'='*60}")
+    print("Ablation study (cross-scene combined data)")
+    print(f"{'='*60}")
 
     results = {}
     kind = "mlp"
@@ -128,10 +123,32 @@ def main():
     )
 
     # Summary
-    print("\n=== ABLATION SUMMARY ===")
+    print(f"\n=== ABLATION SUMMARY ===")
     print(f"{'Config':<20} {'Val MSE':>10} {'Test MSE':>10} {'Test MAE':>10}")
     for name, m in results.items():
         print(f"{name:<20} {m['val_mse']:>10.4f} {m['test_mse']:>10.4f} {m['test_mae']:>10.4f}")
+
+    return results
+
+
+def main():
+    torch.manual_seed(SEED)
+    device = DEVICE
+    print(f"Using device: {device}")
+
+    # Load & combine all scenes
+    train_tensors, test_tensors = load_all_scenes()
+    combined_train = combine_scene_tensors(train_tensors)
+    combined_test = combine_scene_tensors(test_tensors)
+    train_fields = split_fields(combined_train)
+    test_fields = split_fields(combined_test)
+    stats = compute_stats(train_fields)
+
+    flat_tr, seq_tr, meta_tr, y_tr = preprocess(train_fields, stats)
+    flat_te, seq_te, meta_te, y_te = preprocess(test_fields, stats)
+
+    results = run_ablation(flat_tr, seq_tr, meta_tr, y_tr,
+                           flat_te, seq_te, meta_te, y_te)
 
     os.makedirs("artifacts", exist_ok=True)
     with open("artifacts/ablation_results.json", "w") as f:

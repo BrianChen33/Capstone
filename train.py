@@ -1,8 +1,7 @@
 """Training script for Bluetooth AoA indoor localization.
 
-Loads the combined dataset, preprocesses features (no spectrum normalisation),
-trains the selected model architecture, and saves the best checkpoint along
-with training statistics.
+Loads all per-scene datasets, combines training data for cross-scene
+generalization, trains one unified model, and evaluates per-scene.
 """
 import argparse
 import os
@@ -14,6 +13,7 @@ from torch.utils.data import DataLoader
 from shared import (
     DEVICE, safe_load, split_fields, compute_stats,
     preprocess, PositionDataset, make_loaders, save_stats, save_json,
+    SCENE_IDS, get_scene_paths, load_all_scenes, combine_scene_tensors,
 )
 from models import build_model
 
@@ -89,8 +89,8 @@ def evaluate(model, loader, device):
 
 def main():
     parser = argparse.ArgumentParser(description="Train positioning model.")
-    parser.add_argument("--train-path", default="Dataset/train_combined.pt")
-    parser.add_argument("--test-path", default="Dataset/test_combined.pt")
+    parser.add_argument("--scenes", nargs="*", default=None,
+                        help="Scene IDs to include (default: all)")
     parser.add_argument("--model", default="transformer", choices=["mlp", "cnn", "transformer"])
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=10)
@@ -103,45 +103,70 @@ def main():
     device = DEVICE
     print(f"Using device: {device}")
 
-    # Load and preprocess
-    train_tensor = safe_load(args.train_path, allow_unsafe=args.allow_unsafe_load)
-    test_tensor = safe_load(args.test_path, allow_unsafe=args.allow_unsafe_load)
-    train_fields = split_fields(train_tensor)
-    test_fields = split_fields(test_tensor)
+    scenes = args.scenes or SCENE_IDS
 
+    # ── Load all per-scene datasets ──────────────────────────────────
+    train_tensors, test_tensors = load_all_scenes(
+        scenes, allow_unsafe=args.allow_unsafe_load or True,
+    )
+
+    # ── Combine training data across scenes ──────────────────────────
+    combined_train = combine_scene_tensors(train_tensors)
+    train_fields = split_fields(combined_train)
     stats = compute_stats(train_fields)
-    flat_train, seq_train, meta_train, y_train = preprocess(train_fields, stats)
-    flat_test, seq_test, meta_test, y_test = preprocess(test_fields, stats)
 
-    # Train
+    flat_train, seq_train, meta_train, y_train = preprocess(train_fields, stats)
+
+    print(f"\nCombined training set: {combined_train.size(0)} samples from {len(scenes)} scenes")
+
+    # ── Train single unified model ───────────────────────────────────
     dataset = PositionDataset(flat_train, seq_train, meta_train, y_train)
     loaders = make_loaders(dataset, val_ratio=args.val_ratio, batch_size=args.batch_size)
     model = build_model(args.model, flat_dim=flat_train.size(1), meta_dim=meta_train.size(1)).to(device)
-    train_model(model, loaders, device=device, epochs=args.epochs, lr=args.lr)
+    train_info = train_model(model, loaders, device=device, epochs=args.epochs, lr=args.lr)
 
-    # Evaluate on test set
-    test_loader = DataLoader(
-        PositionDataset(flat_test, seq_test, meta_test, y_test),
-        batch_size=args.batch_size,
-    )
-    test_metrics = evaluate(model, test_loader, device)
-    print(f"Test MSE={test_metrics['mse']:.4f}  Test MAE={test_metrics['mae']:.4f}")
-
-    # Save artefacts
+    # ── Save unified model & stats ───────────────────────────────────
     os.makedirs(args.output_dir, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(args.output_dir, "best_model.pt"))
     save_stats(stats, os.path.join(args.output_dir, "dataset_stats.json"))
+
+    # ── Evaluate per-scene on test data ──────────────────────────────
+    all_results = {}
+    for scene_id in scenes:
+        test_fields = split_fields(test_tensors[scene_id])
+        flat_test, seq_test, meta_test, y_test = preprocess(test_fields, stats)
+        test_loader = DataLoader(
+            PositionDataset(flat_test, seq_test, meta_test, y_test),
+            batch_size=args.batch_size,
+        )
+        test_metrics = evaluate(model, test_loader, device)
+        print(f"[{scene_id}] Test MSE={test_metrics['mse']:.4f}  Test MAE={test_metrics['mae']:.4f}")
+        all_results[scene_id] = test_metrics
+
+    # ── Save training report ─────────────────────────────────────────
     save_json(
         os.path.join(args.output_dir, "training_report.json"),
         {
             "model": args.model,
+            "scenes": scenes,
             "epochs": args.epochs,
             "batch_size": args.batch_size,
             "lr": args.lr,
             "val_ratio": args.val_ratio,
-            "test_metrics": test_metrics,
+            "train_samples": combined_train.size(0),
+            "best_val_mse": train_info["best_val_mse"],
+            "per_scene_test": all_results,
         },
     )
+
+    # Summary
+    print(f"\n{'='*60}")
+    print("TRAINING SUMMARY (Unified Cross-Scene Model)")
+    print(f"{'='*60}")
+    print(f"{'Scene':<10} {'Test MSE':>10} {'Test MAE':>10}")
+    for sid, m in all_results.items():
+        print(f"{sid:<10} {m['mse']:>10.4f} {m['mae']:>10.4f}")
+    save_json(os.path.join(args.output_dir, "all_scenes_summary.json"), all_results)
 
 
 if __name__ == "__main__":

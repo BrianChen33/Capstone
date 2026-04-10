@@ -7,8 +7,9 @@ to skip spatial-spectrum normalisation:
   2. ts_only      — only timestamp normalised  (adopted approach)
   3. block_zscore — timestamp + spectra normalised (legacy approach)
 
-A lightweight MLP is trained for 5 epochs under each strategy (×3 seeds)
-to measure validation and test MAE.
+Uses combined cross-scene training data. A lightweight MLP is trained for
+5 epochs under each strategy (×3 seeds) to measure validation and test MAE.
+Results stored as JSON for visualization.py to consume.
 """
 import argparse
 import json
@@ -16,17 +17,17 @@ import math
 from pathlib import Path
 from typing import Dict
 
-import matplotlib.pyplot as plt
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
-from shared import DEVICE, FIELD_SLICES, safe_load, split_fields
+from shared import (
+    DEVICE, FIELD_SLICES, split_fields, SCENE_IDS,
+    get_scene_paths, PROJECT_ROOT,
+    load_all_scenes, combine_scene_tensors,
+)
 
-PROJECT_ROOT = Path(__file__).resolve().parent
-TRAIN_PT_PATH = PROJECT_ROOT / "Dataset" / "train_combined.pt"
-TEST_PT_PATH = PROJECT_ROOT / "Dataset" / "test_combined.pt"
-OUT_DIR = PROJECT_ROOT / "FigData" / "PreprocessExperiments" / "combined"
+OUT_ROOT = PROJECT_ROOT / "FigData" / "PreprocessExperiments"
 SEEDS = [42, 43, 44]
 
 
@@ -152,15 +153,9 @@ def train_one(features, targets, test_features, test_targets, epochs=5, lr=1e-3,
 # ------------------------------------------------------------------
 # Main experiment
 # ------------------------------------------------------------------
-def run_experiments(train_path, test_path, allow_unsafe, out_dir):
+def run_experiments(train_fields, test_fields, out_dir, label=""):
     out_dir.mkdir(parents=True, exist_ok=True)
-    fig_dir = out_dir / "figs"
-    fig_dir.mkdir(exist_ok=True)
 
-    train_tensor = safe_load(train_path, allow_unsafe=allow_unsafe)
-    test_tensor = safe_load(test_path, allow_unsafe=allow_unsafe)
-    train_fields = split_fields(train_tensor)
-    test_fields = split_fields(test_tensor)
     targets = train_fields["gt_pos"][:, :2]
     test_targets = test_fields["gt_pos"][:, :2]
     stats = compute_stats(train_fields)
@@ -185,36 +180,44 @@ def run_experiments(train_path, test_path, allow_unsafe, out_dir):
             "test_mae_mean": float(tm.mean()),
             "test_mae_std": float(tm.std(unbiased=False)),
         }
-        print(f"{name}: val_mae={results[name]['val_mae_mean']:.4f}±{results[name]['val_mae_std']:.4f}, "
+        prefix = f"[{label}] " if label else ""
+        print(f"{prefix}{name}: val_mae={results[name]['val_mae_mean']:.4f}±{results[name]['val_mae_std']:.4f}, "
               f"test_mae={results[name]['test_mae_mean']:.4f}±{results[name]['test_mae_std']:.4f}")
-
-    # Charts
-    labels = list(results.keys())
-    colors = ["#e74c3c", "#2ecc71", "#3498db"]
-    for split in ("val", "test"):
-        vals = [results[k][f"{split}_mae_mean"] for k in labels]
-        errs = [results[k][f"{split}_mae_std"] for k in labels]
-        plt.figure(figsize=(7, 4))
-        plt.bar(labels, vals, yerr=errs, capsize=4, color=colors)
-        plt.ylabel(f"{split.title()} MAE (m)")
-        plt.title(f"Preprocessing Strategy Comparison ({split})")
-        plt.tight_layout()
-        plt.savefig(fig_dir / f"{split}_mae_comparison.png", dpi=150)
-        plt.close()
 
     with open(out_dir / "preprocess_metrics.json", "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
     print("Results saved to", out_dir)
+    return results
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--train-path", default=str(TRAIN_PT_PATH))
-    ap.add_argument("--test-path", default=str(TEST_PT_PATH))
-    ap.add_argument("--output-dir", default=str(OUT_DIR))
+    ap.add_argument("--scenes", nargs="*", default=None,
+                    help="Scene IDs to include (default: all)")
+    ap.add_argument("--output-dir", default=str(OUT_ROOT))
     ap.add_argument("--allow-unsafe", action="store_true")
     args = ap.parse_args()
-    run_experiments(Path(args.train_path), Path(args.test_path), args.allow_unsafe, Path(args.output_dir))
+
+    scenes = args.scenes or SCENE_IDS
+    out_dir = Path(args.output_dir)
+
+    # Load & combine all scene data
+    train_tensors, test_tensors = load_all_scenes(scenes, allow_unsafe=True)
+    combined_train = combine_scene_tensors(train_tensors)
+    combined_test = combine_scene_tensors(test_tensors)
+    train_fields = split_fields(combined_train)
+    test_fields = split_fields(combined_test)
+
+    print(f"\nCombined training: {combined_train.size(0)} samples")
+    print(f"Combined test: {combined_test.size(0)} samples")
+
+    results = run_experiments(train_fields, test_fields, out_dir, label="combined")
+
+    # Also save summary for visualization.py
+    summary = {s: {"val_mae": results[s]["val_mae_mean"], "test_mae": results[s]["test_mae_mean"]}
+               for s in results}
+    with open(out_dir / "all_scenes_preprocess.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
 
 
 if __name__ == "__main__":

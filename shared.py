@@ -7,7 +7,8 @@ import inspect
 import json
 import os
 import warnings
-from typing import Dict, Tuple
+from pathlib import Path
+from typing import Dict, List, Tuple
 
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -16,6 +17,56 @@ from torch.utils.data import DataLoader, Dataset
 # Device configuration — automatically uses CUDA when available
 # ---------------------------------------------------------------------------
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ---------------------------------------------------------------------------
+# Project paths
+# ---------------------------------------------------------------------------
+PROJECT_ROOT = Path(__file__).resolve().parent
+DATASET_DIR = PROJECT_ROOT / "Dataset"
+
+# ---------------------------------------------------------------------------
+# Per-scene helpers
+# ---------------------------------------------------------------------------
+SCENE_IDS: List[str] = ["s13", "s20", "s27", "s34"]
+
+
+def get_scene_paths(scene_id: str, dataset_dir: Path = None) -> Tuple[Path, Path]:
+    """Return (train_path, test_path) for a given scene."""
+    d = dataset_dir or DATASET_DIR
+    train_path = d / "train" / f"train_data-{scene_id}-40-60-seq1.pt"
+    test_path = d / "test" / f"test_data-{scene_id}-40-60-seq1.pt"
+    return train_path, test_path
+
+
+def discover_scenes(dataset_dir: Path = None) -> List[str]:
+    """Discover scene IDs from training data directory."""
+    d = dataset_dir or DATASET_DIR
+    train_dir = d / "train"
+    scenes = []
+    for f in sorted(train_dir.glob("train_data-*.pt")):
+        parts = f.stem.split("-")
+        scenes.append(parts[1])
+    return scenes
+
+
+def load_all_scenes(scenes: List[str] = None,
+                    dataset_dir: Path = None,
+                    allow_unsafe: bool = True
+                    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+    """Load all per-scene datasets and return dicts of {scene_id: tensor}."""
+    scenes = scenes or SCENE_IDS
+    train_data: Dict[str, torch.Tensor] = {}
+    test_data: Dict[str, torch.Tensor] = {}
+    for sid in scenes:
+        tp, ep = get_scene_paths(sid, dataset_dir)
+        train_data[sid] = safe_load(tp, allow_unsafe=allow_unsafe)
+        test_data[sid] = safe_load(ep, allow_unsafe=allow_unsafe)
+    return train_data, test_data
+
+
+def combine_scene_tensors(scene_data: Dict[str, torch.Tensor]) -> torch.Tensor:
+    """Concatenate per-scene tensors into a single tensor."""
+    return torch.cat(list(scene_data.values()), dim=0)
 
 # ---------------------------------------------------------------------------
 # Feature layout: 986-dimensional input vector
